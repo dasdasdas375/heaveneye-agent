@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>HeavenEye Agent needs microphone access for voice input in the agent panel.</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>HeavenEye Agent needs speech recognition access to convert your voice into text prompts.</string>
+</dict>
+</plist>

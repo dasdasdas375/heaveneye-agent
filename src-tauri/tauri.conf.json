@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "HeavenEye Agent",
+  "version": "0.1.0",
+  "identifier": "dev.heaveneye.agent",
+  "build": {
+    "beforeDevCommand": "npm run dev:web",
+    "beforeBuildCommand": "npm run build:web",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "HeavenEye Agent",
+        "width": 1360,
+        "height": 860,
+        "minWidth": 1080,
+        "minHeight": 680,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.icns"
+    ],
+    "macOS": {
+      "entitlements": "HeavenEyeAgent.entitlements",
+      "infoPlist": "Info.plist"
+    }
+  }
+}
