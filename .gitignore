@@ -8,7 +8,6 @@ src-tauri/**/*.dSYM/
 .playwright-cli/
 output/
 .open-source-excluded/
-crm/
 .env
 .env.*
 !.env.example
