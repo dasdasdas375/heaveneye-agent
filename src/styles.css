@@ -2671,8 +2671,16 @@ body.workspace-is-resizing * {
 
 .compare-grid h3 {
   margin: 0;
-  color: var(--text-strong);
+  color: #e8f1fb;
   font-size: 14px;
+}
+
+.compare-modal .inspector-modal-head h2 {
+  color: #f4f8fd;
+}
+
+.compare-modal .inspector-modal-hint {
+  color: #b7c5d3;
 }
 
 .inspector-modal-head {
@@ -2742,6 +2750,7 @@ body.workspace-is-resizing * {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  flex-wrap: wrap;
   min-height: 52px;
   padding: 10px 14px;
   border-bottom: 1px solid var(--line);
@@ -2759,7 +2768,8 @@ body.workspace-is-resizing * {
   display: flex;
   align-items: center;
   gap: 10px;
-  min-width: min(560px, 100%);
+  flex: 1 1 320px;
+  min-width: min(320px, 100%);
   min-height: 38px;
   padding: 4px 8px 4px 12px;
   border: 1px solid var(--line);
@@ -2848,6 +2858,7 @@ body.workspace-is-resizing * {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+  flex-wrap: wrap;
   min-height: 42px;
   padding: 8px 10px;
   border-bottom: 1px solid var(--line);
@@ -2886,6 +2897,14 @@ body.workspace-is-resizing * {
 .json-row.container:hover,
 .json-row.primitive:hover {
   background: rgba(143, 197, 255, 0.04);
+}
+
+.json-row.has-match {
+  background: rgba(255, 221, 87, 0.06);
+}
+
+.json-row.active-match {
+  background: rgba(67, 201, 255, 0.12);
 }
 
 .json-row.closing {
@@ -2940,6 +2959,22 @@ body.workspace-is-resizing * {
   flex: 0 0 auto;
   color: var(--muted);
   font-size: 11px;
+}
+
+.json-hit {
+  padding: 1px 1px 2px;
+  border-radius: 4px;
+  background: rgba(255, 221, 87, 0.22);
+  box-shadow: inset 0 0 0 1px rgba(255, 221, 87, 0.18);
+  color: #fff7c8;
+}
+
+.json-hit.active {
+  background: rgba(67, 201, 255, 0.34);
+  box-shadow:
+    inset 0 0 0 1px rgba(67, 201, 255, 0.46),
+    0 0 0 1px rgba(67, 201, 255, 0.16);
+  color: #f5fcff;
 }
 
 .json-inline-toggle,
