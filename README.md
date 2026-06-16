@@ -26,13 +26,22 @@ HeavenEye Agent is an AI-assisted HTTP/HTTPS capture and debugging workbench for
 - [Security policy](SECURITY.md)
 - [Contributing guide](CONTRIBUTING.md)
 
+## Desktop Downloads
+
+Build artifacts are platform specific:
+
+- Windows users should download the `heaveneye-agent-windows` artifact, or the `.exe` / `.msi` assets from a tagged GitHub Release.
+- macOS users should download the `heaveneye-agent-macos` artifact, or the `.dmg` asset from a tagged GitHub Release.
+
+The GitHub Actions workflow builds Windows on `windows-latest` and macOS on `macos-latest`, so adding Windows packaging does not replace the macOS package path.
+
 ## Quick Start
 
 Requirements:
 
 - Node.js `>=20.19.0` or `>=22.12.0`
 - Rust stable toolchain
-- macOS for the current desktop packaging path
+- macOS or Windows for the desktop app packaging path
 
 ```bash
 npm install
@@ -62,6 +71,8 @@ CAPTURE_HOSTS=app.example.test
 3. Trust the generated local CA certificate when the app prompts you.
 4. Point your browser, simulator, device or system proxy to `127.0.0.1:9090`.
 5. Browse the target application and inspect requests in the workbench.
+
+On Windows, the one-click certificate action installs the CA into the current user's trusted Root store, and the system proxy action updates the current user's WinINet proxy settings.
 
 The root certificate is generated locally and ignored by git:
 

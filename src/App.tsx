@@ -1010,10 +1010,27 @@ function shellQuote(value: string) {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
+function powerShellQuote(value: string) {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+function isWindowsRuntime() {
+  if (typeof navigator === "undefined") {
+    return false;
+  }
+  return /win/i.test(`${navigator.platform} ${navigator.userAgent}`);
+}
+
 function buildTrustCertificateCommand(certPath: string) {
-  return certPath
-    ? `sudo security add-trusted-cert -d -r trustRoot -p ssl -k /Library/Keychains/System.keychain ${shellQuote(certPath)}`
-    : "";
+  if (!certPath) {
+    return "";
+  }
+  if (isWindowsRuntime()) {
+    return `powershell -NoProfile -ExecutionPolicy Bypass -Command "Import-Certificate -FilePath ${powerShellQuote(
+      certPath,
+    )} -CertStoreLocation Cert:\\CurrentUser\\Root"`;
+  }
+  return `sudo security add-trusted-cert -d -r trustRoot -p ssl -k /Library/Keychains/System.keychain ${shellQuote(certPath)}`;
 }
 
 function buildCertTrustFailureDialog(

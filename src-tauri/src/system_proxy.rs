@@ -5,6 +5,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 const TARGET_HOST: &str = "127.0.0.1";
+const WINDOWS_SERVICE_NAME: &str = "Windows Current User Proxy";
+const WINDOWS_INTERNET_SETTINGS_KEY: &str =
+    "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
 
 #[derive(Clone)]
 pub struct SystemProxyManager {
@@ -17,6 +20,16 @@ struct SystemProxySnapshot {
     http: SystemProxySetting,
     https: SystemProxySetting,
     socks: SystemProxySetting,
+    #[serde(default)]
+    windows: Option<WindowsProxySnapshot>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowsProxySnapshot {
+    proxy_enable: Option<u32>,
+    proxy_server: Option<String>,
+    proxy_override: Option<String>,
 }
 
 impl SystemProxyManager {
@@ -25,6 +38,9 @@ impl SystemProxyManager {
     }
 
     pub fn status(&self, target_port: u16) -> Result<SystemProxyStatus, String> {
+        if cfg!(target_os = "windows") {
+            return self.windows_status(target_port);
+        }
         if !cfg!(target_os = "macos") {
             return Ok(self.unsupported_status(target_port));
         }
@@ -37,6 +53,9 @@ impl SystemProxyManager {
     }
 
     pub fn apply(&self, target_port: u16) -> Result<SystemProxyStatus, String> {
+        if cfg!(target_os = "windows") {
+            return self.apply_windows(target_port);
+        }
         if !cfg!(target_os = "macos") {
             return Ok(self.unsupported_status(target_port));
         }
@@ -48,6 +67,7 @@ impl SystemProxyManager {
                 http: get_proxy_setting(&service, "-getwebproxy")?,
                 https: get_proxy_setting(&service, "-getsecurewebproxy")?,
                 socks: get_proxy_setting(&service, "-getsocksfirewallproxy")?,
+                windows: None,
             };
             self.write_snapshot(&snapshot)?;
         }
@@ -63,6 +83,9 @@ impl SystemProxyManager {
     }
 
     pub fn restore(&self, target_port: u16) -> Result<SystemProxyStatus, String> {
+        if cfg!(target_os = "windows") {
+            return self.restore_windows(target_port);
+        }
         if !cfg!(target_os = "macos") {
             return Ok(self.unsupported_status(target_port));
         }
@@ -95,6 +118,55 @@ impl SystemProxyManager {
         let _ = fs::remove_file(&self.snapshot_path);
         let mut status = self.status(target_port)?;
         status.message = format!("已恢复 {} 的系统代理设置。", snapshot.service);
+        Ok(status)
+    }
+
+    fn windows_status(&self, target_port: u16) -> Result<SystemProxyStatus, String> {
+        let settings = read_windows_proxy_snapshot()?;
+        let enabled = settings.proxy_enable.unwrap_or(0) != 0;
+        let (http, https, socks) =
+            parse_windows_proxy_settings(enabled, settings.proxy_server.as_deref().unwrap_or(""));
+        Ok(self.build_status(
+            WINDOWS_SERVICE_NAME.to_string(),
+            target_port,
+            http,
+            https,
+            socks,
+        ))
+    }
+
+    fn apply_windows(&self, target_port: u16) -> Result<SystemProxyStatus, String> {
+        if !self.snapshot_path.exists() {
+            let snapshot = SystemProxySnapshot {
+                service: WINDOWS_SERVICE_NAME.to_string(),
+                http: empty_setting(),
+                https: empty_setting(),
+                socks: empty_setting(),
+                windows: Some(read_windows_proxy_snapshot()?),
+            };
+            self.write_snapshot(&snapshot)?;
+        }
+
+        set_windows_proxy(target_port)?;
+        self.status(target_port)
+    }
+
+    fn restore_windows(&self, target_port: u16) -> Result<SystemProxyStatus, String> {
+        let Some(snapshot) = self.read_snapshot()? else {
+            let mut status = self.status(target_port)?;
+            status.message = "No system proxy snapshot is available to restore.".to_string();
+            return Ok(status);
+        };
+        let Some(windows) = snapshot.windows else {
+            let mut status = self.status(target_port)?;
+            status.message = "The saved proxy snapshot was not created on Windows.".to_string();
+            return Ok(status);
+        };
+
+        restore_windows_proxy_snapshot(&windows)?;
+        let _ = fs::remove_file(&self.snapshot_path);
+        let mut status = self.status(target_port)?;
+        status.message = "Restored Windows current-user proxy settings.".to_string();
         Ok(status)
     }
 
@@ -265,6 +337,221 @@ fn restore_web_proxy(
     Ok(())
 }
 
+fn read_windows_proxy_snapshot() -> Result<WindowsProxySnapshot, String> {
+    let key = powershell_string(WINDOWS_INTERNET_SETTINGS_KEY);
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$path = {key}
+if (-not (Test-Path $path)) {{ New-Item -Path $path -Force | Out-Null }}
+$item = Get-ItemProperty -Path $path
+$proxyEnable = $null
+$proxyServer = $null
+$proxyOverride = $null
+if ($null -ne $item.ProxyEnable) {{ $proxyEnable = [int]$item.ProxyEnable }}
+if ($null -ne $item.ProxyServer) {{ $proxyServer = [string]$item.ProxyServer }}
+if ($null -ne $item.ProxyOverride) {{ $proxyOverride = [string]$item.ProxyOverride }}
+[pscustomobject]@{{
+  proxyEnable = $proxyEnable
+  proxyServer = $proxyServer
+  proxyOverride = $proxyOverride
+}} | ConvertTo-Json -Compress
+"#
+    );
+    let output = run_powershell(&script)?;
+    serde_json::from_str(output.trim()).map_err(|error| error.to_string())
+}
+
+fn set_windows_proxy(target_port: u16) -> Result<(), String> {
+    let key = powershell_string(WINDOWS_INTERNET_SETTINGS_KEY);
+    let proxy_server =
+        powershell_string(&format!("http={TARGET_HOST}:{target_port};https={TARGET_HOST}:{target_port}"));
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$path = {key}
+if (-not (Test-Path $path)) {{ New-Item -Path $path -Force | Out-Null }}
+New-ItemProperty -Path $path -Name ProxyEnable -PropertyType DWord -Value 1 -Force | Out-Null
+New-ItemProperty -Path $path -Name ProxyServer -PropertyType String -Value {proxy_server} -Force | Out-Null
+{notify}
+"#,
+        notify = windows_proxy_refresh_script(),
+    );
+    run_powershell(&script).map(|_| ())
+}
+
+fn restore_windows_proxy_snapshot(snapshot: &WindowsProxySnapshot) -> Result<(), String> {
+    let key = powershell_string(WINDOWS_INTERNET_SETTINGS_KEY);
+    let proxy_enable_statement = match snapshot.proxy_enable {
+        Some(value) => format!(
+            "New-ItemProperty -Path $path -Name ProxyEnable -PropertyType DWord -Value {value} -Force | Out-Null"
+        ),
+        None => {
+            "Remove-ItemProperty -Path $path -Name ProxyEnable -ErrorAction SilentlyContinue"
+                .to_string()
+        }
+    };
+    let proxy_server_statement =
+        windows_restore_string_property("ProxyServer", snapshot.proxy_server.as_deref());
+    let proxy_override_statement =
+        windows_restore_string_property("ProxyOverride", snapshot.proxy_override.as_deref());
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$path = {key}
+if (-not (Test-Path $path)) {{ New-Item -Path $path -Force | Out-Null }}
+{proxy_enable_statement}
+{proxy_server_statement}
+{proxy_override_statement}
+{notify}
+"#,
+        notify = windows_proxy_refresh_script(),
+    );
+    run_powershell(&script).map(|_| ())
+}
+
+fn windows_restore_string_property(name: &str, value: Option<&str>) -> String {
+    match value {
+        Some(value) => format!(
+            "New-ItemProperty -Path $path -Name {name} -PropertyType String -Value {value} -Force | Out-Null",
+            name = powershell_string(name),
+            value = powershell_string(value)
+        ),
+        None => format!(
+            "Remove-ItemProperty -Path $path -Name {name} -ErrorAction SilentlyContinue",
+            name = powershell_string(name)
+        ),
+    }
+}
+
+fn parse_windows_proxy_settings(
+    enabled: bool,
+    proxy_server: &str,
+) -> (SystemProxySetting, SystemProxySetting, SystemProxySetting) {
+    let mut http = empty_setting();
+    let mut https = empty_setting();
+    let mut socks = empty_setting();
+    let entries = proxy_server
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>();
+
+    if entries.is_empty() {
+        return (http, https, socks);
+    }
+
+    let has_protocol_entries = entries.iter().any(|entry| entry.contains('='));
+    if !has_protocol_entries {
+        http = windows_proxy_setting(enabled, entries[0]);
+        https = http.clone();
+        return (http, https, socks);
+    }
+
+    for entry in entries {
+        let Some((scheme, endpoint)) = entry.split_once('=') else {
+            continue;
+        };
+        match scheme.trim().to_ascii_lowercase().as_str() {
+            "http" => http = windows_proxy_setting(enabled, endpoint),
+            "https" | "secure" => https = windows_proxy_setting(enabled, endpoint),
+            "socks" | "socks4" | "socks5" => socks = windows_proxy_setting(enabled, endpoint),
+            _ => {}
+        }
+    }
+
+    (http, https, socks)
+}
+
+fn windows_proxy_setting(enabled: bool, endpoint: &str) -> SystemProxySetting {
+    let (host, port) = parse_windows_proxy_endpoint(endpoint);
+    SystemProxySetting {
+        enabled: enabled && !host.is_empty(),
+        host,
+        port,
+    }
+}
+
+fn parse_windows_proxy_endpoint(endpoint: &str) -> (String, Option<u16>) {
+    let value = endpoint
+        .trim()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_start_matches("socks://");
+    if value.is_empty() {
+        return (String::new(), None);
+    }
+
+    if let Some(rest) = value.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            let host = rest[..end].to_string();
+            let port = rest[end + 1..]
+                .strip_prefix(':')
+                .and_then(|value| value.parse::<u16>().ok());
+            return (host, port);
+        }
+    }
+
+    if let Some((host, port)) = value.rsplit_once(':') {
+        if !host.contains(':') {
+            return (host.to_string(), port.parse::<u16>().ok());
+        }
+    }
+
+    (value.to_string(), None)
+}
+
+fn windows_proxy_refresh_script() -> &'static str {
+    r#"
+$signature = @'
+using System;
+using System.Runtime.InteropServices;
+public static class HeavenEyeWinInetRefresh {
+  [DllImport("wininet.dll", SetLastError = true)]
+  public static extern bool InternetSetOption(IntPtr hInternet, int dwOption, IntPtr lpBuffer, int dwBufferLength);
+}
+'@
+Add-Type -TypeDefinition $signature -ErrorAction SilentlyContinue
+[HeavenEyeWinInetRefresh]::InternetSetOption([IntPtr]::Zero, 39, [IntPtr]::Zero, 0) | Out-Null
+[HeavenEyeWinInetRefresh]::InternetSetOption([IntPtr]::Zero, 37, [IntPtr]::Zero, 0) | Out-Null
+"#
+}
+
+fn run_powershell(script: &str) -> Result<String, String> {
+    let output = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .output()
+        .map_err(|error| format!("powershell.exe failed to start: {error}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if output.status.success() {
+        return Ok(stdout);
+    }
+
+    let message = [stdout, stderr]
+        .into_iter()
+        .filter(|item| !item.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(if message.is_empty() {
+        "PowerShell command failed.".into()
+    } else {
+        message
+    })
+}
+
+fn powershell_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 fn run_networksetup(args: &[&str]) -> Result<String, String> {
     let output = Command::new("networksetup")
         .args(args)
@@ -285,7 +572,7 @@ fn run_networksetup(args: &[&str]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_proxy_setting;
+    use super::{parse_proxy_setting, parse_windows_proxy_settings};
 
     #[test]
     fn parses_enabled_networksetup_proxy_output() {
@@ -308,5 +595,46 @@ mod tests {
         assert!(!setting.enabled);
         assert_eq!(setting.host, "");
         assert_eq!(setting.port, Some(0));
+    }
+
+    #[test]
+    fn parses_windows_per_scheme_proxy_server() {
+        let (http, https, socks) = parse_windows_proxy_settings(
+            true,
+            "http=127.0.0.1:9090;https=127.0.0.1:9090;socks=127.0.0.1:1080",
+        );
+
+        assert!(http.enabled);
+        assert_eq!(http.host, "127.0.0.1");
+        assert_eq!(http.port, Some(9090));
+        assert!(https.enabled);
+        assert_eq!(https.host, "127.0.0.1");
+        assert_eq!(https.port, Some(9090));
+        assert!(socks.enabled);
+        assert_eq!(socks.port, Some(1080));
+    }
+
+    #[test]
+    fn parses_windows_single_proxy_for_http_and_https() {
+        let (http, https, socks) = parse_windows_proxy_settings(true, "127.0.0.1:9090");
+
+        assert!(http.enabled);
+        assert!(https.enabled);
+        assert!(!socks.enabled);
+        assert_eq!(http.host, "127.0.0.1");
+        assert_eq!(https.host, "127.0.0.1");
+        assert_eq!(http.port, Some(9090));
+        assert_eq!(https.port, Some(9090));
+    }
+
+    #[test]
+    fn keeps_windows_proxy_values_disabled_when_proxy_enable_is_off() {
+        let (http, https, _) =
+            parse_windows_proxy_settings(false, "http=127.0.0.1:9090;https=127.0.0.1:9090");
+
+        assert!(!http.enabled);
+        assert!(!https.enabled);
+        assert_eq!(http.host, "127.0.0.1");
+        assert_eq!(https.port, Some(9090));
     }
 }

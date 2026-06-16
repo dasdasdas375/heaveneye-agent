@@ -102,14 +102,24 @@ fn env_or_default(key: &str, default: &str) -> String {
 }
 
 fn user_data_dir() -> PathBuf {
-    let home = env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
     if cfg!(target_os = "macos") {
+        let home = env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
         home.join("Library")
             .join("Application Support")
             .join("HeavenEye Agent")
+    } else if cfg!(target_os = "windows") {
+        env::var_os("APPDATA")
+            .or_else(|| env::var_os("LOCALAPPDATA"))
+            .or_else(|| env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("HeavenEye Agent")
     } else {
+        let home = env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
         home.join(".heaveneye-agent")
     }
 }
