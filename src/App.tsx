@@ -60,6 +60,7 @@ import {
   buildRequestUrl,
 } from "./lib/request-export";
 import { buildHarArchive, buildSessionExport } from "./lib/session-export";
+import { parseSseEvents, type SseEventRow } from "./lib/sse";
 import { formatSpeechRecognitionError, shouldAutoClearError } from "./lib/ui-errors";
 import {
   InspectorPreview,
@@ -1070,6 +1071,8 @@ function byteLabel(value: number) {
 const bodyPreviewLimitBytes = 128 * 1024;
 const textEncoder = typeof TextEncoder !== "undefined" ? new TextEncoder() : null;
 
+type PayloadTab = "request" | "response" | "eventstream";
+
 function utf8ByteLength(value: string) {
   if (textEncoder) {
     return textEncoder.encode(value).length;
@@ -1127,6 +1130,16 @@ function fullBodyMeta(body: CaptureBodyContent): InspectorPayloadMeta {
     capturedBytes: body.size || undefined,
     truncated: !body.complete,
   };
+}
+
+function isStreamingFlow(flow: CaptureFlow) {
+  const tags = Array.isArray(flow.tags) ? flow.tags : [];
+  return tags.includes("streaming-response") || tags.includes("sse");
+}
+
+function isEventStreamFlow(flow: CaptureFlow) {
+  const contentType = headerValue(flow.responseHeaders, "content-type").toLowerCase();
+  return isStreamingFlow(flow) || contentType.includes("text/event-stream");
 }
 
 function compactByteLabel(value: number) {
@@ -1239,6 +1252,137 @@ function InspectorBlock({
   );
 }
 
+function EventStreamPanel({
+  events,
+  rawContent,
+  flow,
+  copiedKey,
+  onCopy,
+  onExpand,
+}: {
+  events: SseEventRow[];
+  rawContent: string;
+  flow: CaptureFlow;
+  copiedKey: string | null;
+  onCopy: (value: string, key: string) => void;
+  onExpand: (title: string, value: unknown, meta?: InspectorPayloadMeta) => void;
+}) {
+  const [selectedIndex, setSelectedIndex] = useState(0);
+  const isOpen = !flow.completedAt;
+
+  useEffect(() => {
+    setSelectedIndex(0);
+  }, [flow.id]);
+
+  useEffect(() => {
+    if (selectedIndex >= events.length) {
+      setSelectedIndex(Math.max(events.length - 1, 0));
+    }
+  }, [events.length, selectedIndex]);
+
+  const selectedEvent = events[selectedIndex] || null;
+  const selectedValue = selectedEvent?.data || selectedEvent?.raw || "";
+  const selectedFormatted = selectedValue ? formatInspectorContent(selectedValue) : null;
+  const rawMeta: InspectorPayloadMeta = bodyPreviewMeta(flow, "response");
+  const copyKey = `eventstream-${flow.id}`;
+  const selectedCopyKey = selectedEvent ? `eventstream-event-${flow.id}-${selectedEvent.index}` : copyKey;
+
+  return (
+    <div className="eventstream-panel">
+      <div className="eventstream-toolbar">
+        <div className="eventstream-state">
+          <span className={["eventstream-dot", isOpen ? "live" : ""].join(" ")} />
+          <strong>EventStream</strong>
+          <span>{events.length} events</span>
+          <span>{byteLabel(flow.responseSize)}</span>
+        </div>
+        <div className="inspector-actions">
+          <button
+            type="button"
+            className="inline-code-action"
+            disabled={!rawContent.trim()}
+            onClick={() => onCopy(rawContent, copyKey)}
+            title="复制 EventStream 原文"
+          >
+            <Copy size={13} />
+            <span>{copiedKey === copyKey ? "已复制" : "复制原文"}</span>
+          </button>
+          <button
+            type="button"
+            className="inline-code-action"
+            disabled={!rawContent.trim()}
+            onClick={() => onExpand("EventStream", rawContent, rawMeta)}
+            title="放大查看 EventStream"
+          >
+            <Maximize2 size={13} />
+            <span>放大查看</span>
+          </button>
+        </div>
+      </div>
+
+      {events.length ? (
+        <div className="eventstream-grid">
+          <div className="eventstream-list" role="listbox" aria-label="EventStream events">
+            <div className="eventstream-list-head">
+              <span>#</span>
+              <span>Event</span>
+              <span>Data</span>
+              <span>ID</span>
+            </div>
+            {events.map((event, index) => (
+              <button
+                key={`${event.index}-${event.id}-${index}`}
+                type="button"
+                className={["eventstream-row", index === selectedIndex ? "selected" : ""].join(" ")}
+                onClick={() => setSelectedIndex(index)}
+                role="option"
+                aria-selected={index === selectedIndex}
+              >
+                <span>{event.index}</span>
+                <span>{event.event}</span>
+                <span>{event.data || event.raw || "-"}</span>
+                <span>{event.id || (event.complete ? "-" : "pending")}</span>
+              </button>
+            ))}
+          </div>
+          <div className="eventstream-detail">
+            <div className="eventstream-detail-head">
+              <div>
+                <strong>{selectedEvent ? `${selectedEvent.event} #${selectedEvent.index}` : "Event"}</strong>
+                {selectedEvent && !selectedEvent.complete ? <span>pending</span> : null}
+              </div>
+              <button
+                type="button"
+                className="inline-code-action compact"
+                disabled={!selectedValue}
+                onClick={() => onCopy(selectedValue, selectedCopyKey)}
+                title="复制当前事件 data"
+              >
+                <Copy size={13} />
+                <span>{copiedKey === selectedCopyKey ? "已复制" : "复制"}</span>
+              </button>
+            </div>
+            {selectedFormatted ? (
+              <InspectorPreview
+                content={selectedFormatted.content}
+                language={selectedFormatted.language}
+                meta={rawMeta}
+              />
+            ) : (
+              <div className="empty-line">Empty</div>
+            )}
+          </div>
+        </div>
+      ) : (
+        <div className="eventstream-empty">
+          <Radio size={15} />
+          <span>{isOpen ? "等待服务器发送事件..." : "没有捕获到 EventStream 事件。"}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PayloadSwitcher({
   flow,
   queryParams,
@@ -1260,38 +1404,66 @@ function PayloadSwitcher({
   onExpand: (title: string, value: unknown, meta?: InspectorPayloadMeta) => void;
   onCompare: () => void;
 }) {
+  const isEventStream = isEventStreamFlow(flow);
+  const usableFullResponseBody = isEventStream ? undefined : fullResponseBody;
   const requestBodyValue = fullRequestBody?.content ?? flow.requestBodyPreview;
-  const responseBodyValue = fullResponseBody?.content ?? flow.responseBodyPreview;
+  const responseBodyValue = usableFullResponseBody?.content ?? flow.responseBodyPreview;
   const requestBodyMeta = fullRequestBody ? fullBodyMeta(fullRequestBody) : bodyPreviewMeta(flow, "request");
-  const responseBodyMeta = fullResponseBody ? fullBodyMeta(fullResponseBody) : bodyPreviewMeta(flow, "response");
+  const responseBodyMeta = usableFullResponseBody ? fullBodyMeta(usableFullResponseBody) : bodyPreviewMeta(flow, "response");
+  const eventStreamEvents = useMemo(() => parseSseEvents(responseBodyValue || ""), [responseBodyValue]);
   const hasQueryParams = Object.keys(queryParams).length > 0;
   const hasRequestBody = Boolean(requestBodyValue);
   const hasRequestPayload = hasQueryParams || hasRequestBody;
   const [open, setOpen] = useState(true);
-  const [activeTab, setActiveTab] = useState<"request" | "response">(() =>
-    hasRequestPayload ? "request" : "response",
+  const [activeTab, setActiveTab] = useState<PayloadTab>(() =>
+    isEventStream ? "eventstream" : hasRequestPayload ? "request" : "response",
   );
 
   useEffect(() => {
-    setActiveTab(hasRequestPayload ? "request" : "response");
+    setActiveTab(isEventStream ? "eventstream" : hasRequestPayload ? "request" : "response");
   }, [flow.id]);
 
   useEffect(() => {
     if (!hasRequestPayload && activeTab === "request") {
+      setActiveTab(isEventStream ? "eventstream" : "response");
+    }
+    if (!isEventStream && activeTab === "eventstream") {
       setActiveTab("response");
     }
-  }, [activeTab, hasRequestPayload]);
+  }, [activeTab, hasRequestPayload, isEventStream]);
 
   const requestPayload = {
     ...(hasQueryParams ? { queryParams } : {}),
     ...(hasRequestBody ? { requestBody: requestBodyValue } : {}),
   };
-  const visibleActiveTab = hasRequestPayload ? activeTab : "response";
-  const activeFullBody = visibleActiveTab === "request" ? fullRequestBody : fullResponseBody;
-  const activePayload = visibleActiveTab === "request" ? requestPayload : responseBodyValue;
-  const activePayloadTitle = visibleActiveTab === "request" ? copy.payloadRequestTitle : copy.payloadResponseTitle;
+  const visibleActiveTab: PayloadTab = activeTab === "request" && !hasRequestPayload
+    ? isEventStream
+      ? "eventstream"
+      : "response"
+    : activeTab === "eventstream" && !isEventStream
+      ? "response"
+      : activeTab;
+  const activeFullBody =
+    visibleActiveTab === "request" ? fullRequestBody : visibleActiveTab === "response" ? usableFullResponseBody : undefined;
+  const activePayload =
+    visibleActiveTab === "request"
+      ? requestPayload
+      : visibleActiveTab === "eventstream"
+        ? responseBodyValue
+        : responseBodyValue;
+  const activePayloadTitle =
+    visibleActiveTab === "request"
+      ? copy.payloadRequestTitle
+      : visibleActiveTab === "eventstream"
+        ? "EventStream"
+        : copy.payloadResponseTitle;
   const activePayloadMeta = visibleActiveTab === "request" ? requestBodyMeta : responseBodyMeta;
-  const activePayloadCopyKey = visibleActiveTab === "request" ? `request-payload-${flow.id}` : `response-body-${flow.id}`;
+  const activePayloadCopyKey =
+    visibleActiveTab === "request"
+      ? `request-payload-${flow.id}`
+      : visibleActiveTab === "eventstream"
+        ? `eventstream-${flow.id}`
+        : `response-body-${flow.id}`;
   const activePayloadHasContent = visibleActiveTab === "request" ? hasRequestPayload : Boolean(responseBodyValue);
   const activePayloadCopyLabel = copiedKey === activePayloadCopyKey ? copy.copied : copy.copy;
   const bodyMetaLabel = activeFullBody?.complete
@@ -1330,6 +1502,15 @@ function PayloadSwitcher({
             >
               {copy.payloadResponse}
             </button>
+            {isEventStream ? (
+              <button
+                type="button"
+                className={visibleActiveTab === "eventstream" ? "active" : ""}
+                onClick={() => setActiveTab("eventstream")}
+              >
+                EventStream
+              </button>
+            ) : null}
           </div>
           {bodyMetaLabel ? <span className="payload-body-state">{bodyMetaLabel}</span> : null}
         </div>
@@ -1393,6 +1574,15 @@ function PayloadSwitcher({
                 />
               ) : null}
             </div>
+          ) : visibleActiveTab === "eventstream" ? (
+            <EventStreamPanel
+              events={eventStreamEvents}
+              rawContent={responseBodyValue || ""}
+              flow={flow}
+              copiedKey={copiedKey}
+              onCopy={onCopy}
+              onExpand={onExpand}
+            />
           ) : (
             <div className="payload-pane">
               <InspectorBlock
@@ -3875,7 +4065,9 @@ export function App() {
       return;
     }
     void cacheFullBody(selectedFlow, "request");
-    void cacheFullBody(selectedFlow, "response");
+    if (!isEventStreamFlow(selectedFlow)) {
+      void cacheFullBody(selectedFlow, "response");
+    }
   }, [selectedFlow?.id]);
 
   return (
@@ -4308,7 +4500,9 @@ export function App() {
                           ) : null}
                           {requestColumns.type ? <span className="type-cell">{requestType}</span> : null}
                           {requestColumns.size ? (
-                            <span className="size-cell">{flow.completedAt ? compactByteLabel(flow.responseSize) : "-"}</span>
+                            <span className="size-cell">
+                              {flow.completedAt || isStreamingFlow(flow) ? compactByteLabel(flow.responseSize) : "-"}
+                            </span>
                           ) : null}
                           {requestColumns.captured ? (
                             <span className="started-cell">

@@ -1832,10 +1832,35 @@ fn handle_tls_mitm_connection(
                         );
                     }
 
-                    match relay_https_streaming_response(upstream_response, &mut tls_stream) {
+                    let live_update_headers = response_headers.clone();
+                    let live_update_flows = flows.clone();
+                    let live_update_flow_id = flow_id_for_update.clone();
+                    match relay_https_streaming_response(
+                        upstream_response,
+                        &mut tls_stream,
+                        |preview_bytes, response_size| {
+                            let response_preview = streaming_preview_from_bytes(
+                                preview_bytes,
+                                response_size,
+                                &live_update_headers,
+                            );
+                            update_streaming_flow(
+                                &live_update_flows,
+                                &live_update_flow_id,
+                                request_started_at,
+                                response_preview,
+                                response_size,
+                                String::new(),
+                                false,
+                            );
+                        },
+                    ) {
                         Ok((preview_bytes, response_size)) => {
-                            let response_preview =
-                                streaming_preview_from_bytes(&preview_bytes, response_size);
+                            let response_preview = streaming_preview_from_bytes(
+                                &preview_bytes,
+                                response_size,
+                                &response_headers,
+                            );
                             update_streaming_flow(
                                 &flows,
                                 &flow_id_for_update,
@@ -1843,6 +1868,7 @@ fn handle_tls_mitm_connection(
                                 response_preview,
                                 response_size,
                                 String::new(),
+                                true,
                             );
                         }
                         Err(error) => {
@@ -1853,6 +1879,7 @@ fn handle_tls_mitm_connection(
                                 streaming_error_preview(&error),
                                 0,
                                 "streaming_response_error".into(),
+                                true,
                             );
                             return Err(error);
                         }
@@ -2311,10 +2338,14 @@ fn read_https_response_to_end(mut response: OpenHttpsResponse) -> Result<Vec<u8>
     Ok(response_bytes)
 }
 
-fn relay_https_streaming_response(
+fn relay_https_streaming_response<F>(
     mut response: OpenHttpsResponse,
     client_stream: &mut StreamOwned<ServerConnection, TcpStream>,
-) -> Result<(Vec<u8>, u64), String> {
+    mut on_progress: F,
+) -> Result<(Vec<u8>, u64), String>
+where
+    F: FnMut(&[u8], u64),
+{
     let _ = response.stream.sock.set_read_timeout(None);
     client_stream
         .write_all(&response.head)
@@ -2323,9 +2354,18 @@ fn relay_https_streaming_response(
 
     let mut preview_bytes = Vec::new();
     let mut response_size = 0u64;
+    let mut last_progress_at = Instant::now()
+        .checked_sub(Duration::from_millis(1000))
+        .unwrap_or_else(Instant::now);
     if !response.remainder.is_empty() {
         response_size += response.remainder.len() as u64;
         append_stream_preview(&mut preview_bytes, &response.remainder);
+        emit_streaming_progress(
+            &mut on_progress,
+            &preview_bytes,
+            response_size,
+            &mut last_progress_at,
+        );
         if !write_streaming_bytes(client_stream, &response.remainder)? {
             return Ok((preview_bytes, response_size));
         }
@@ -2339,6 +2379,12 @@ fn relay_https_streaming_response(
                 let bytes = &chunk[..read];
                 response_size += read as u64;
                 append_stream_preview(&mut preview_bytes, bytes);
+                emit_streaming_progress(
+                    &mut on_progress,
+                    &preview_bytes,
+                    response_size,
+                    &mut last_progress_at,
+                );
                 if !write_streaming_bytes(client_stream, bytes)? {
                     break;
                 }
@@ -2349,6 +2395,23 @@ fn relay_https_streaming_response(
     }
 
     Ok((preview_bytes, response_size))
+}
+
+fn emit_streaming_progress<F>(
+    on_progress: &mut F,
+    preview_bytes: &[u8],
+    response_size: u64,
+    last_progress_at: &mut Instant,
+) where
+    F: FnMut(&[u8], u64),
+{
+    if preview_bytes.is_empty() {
+        return;
+    }
+    if last_progress_at.elapsed() >= Duration::from_millis(350) {
+        on_progress(preview_bytes, response_size);
+        *last_progress_at = Instant::now();
+    }
 }
 
 fn write_streaming_bytes<W: Write>(writer: &mut W, bytes: &[u8]) -> Result<bool, String> {
@@ -2406,20 +2469,71 @@ fn streaming_response_open_preview(headers: &HashMap<String, String>) -> BufferP
     }
 }
 
-fn streaming_preview_from_bytes(preview_bytes: &[u8], response_size: u64) -> BufferPreview {
+fn streaming_preview_from_bytes(
+    preview_bytes: &[u8],
+    response_size: u64,
+    headers: &HashMap<String, String>,
+) -> BufferPreview {
+    let display_bytes = if headers
+        .get("transfer-encoding")
+        .map(|value| value.to_ascii_lowercase().contains("chunked"))
+        .unwrap_or(false)
+    {
+        decode_chunked_partial(preview_bytes)
+    } else {
+        preview_bytes.to_vec()
+    };
     let preview = if preview_bytes.is_empty() {
         "[streaming response completed without captured body bytes]".to_string()
     } else {
-        String::from_utf8_lossy(preview_bytes).to_string()
+        String::from_utf8_lossy(&display_bytes).to_string()
     };
     let preview_truncated = response_size > preview_bytes.len() as u64;
     BufferPreview {
         size: response_size.min(usize::MAX as u64) as usize,
         decoded_size: preview.len(),
-        text_body_path: store_text_body(preview.as_bytes()),
+        text_body_path: None,
         preview,
         preview_truncated,
     }
+}
+
+fn decode_chunked_partial(body: &[u8]) -> Vec<u8> {
+    let mut cursor = 0usize;
+    let mut decoded = Vec::new();
+
+    while cursor < body.len() {
+        let Some(line_offset) = body[cursor..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+        else {
+            break;
+        };
+        let line_end = cursor + line_offset;
+        let line = String::from_utf8_lossy(&body[cursor..line_end]);
+        let size_text = line.split(';').next().unwrap_or_default().trim();
+        let Ok(size) = usize::from_str_radix(size_text, 16) else {
+            break;
+        };
+        cursor = line_end + 2;
+        if size == 0 {
+            break;
+        }
+        if body.len() < cursor + size {
+            break;
+        }
+        decoded.extend_from_slice(&body[cursor..cursor + size]);
+        cursor += size;
+        if body.len() < cursor + 2 {
+            break;
+        }
+        if &body[cursor..cursor + 2] != b"\r\n" {
+            break;
+        }
+        cursor += 2;
+    }
+
+    decoded
 }
 
 fn streaming_error_preview(error: &str) -> BufferPreview {
@@ -4061,13 +4175,16 @@ fn update_streaming_flow(
     response_preview: BufferPreview,
     response_size: u64,
     error_type: String,
+    completed: bool,
 ) {
     let mut flows = flows.lock().expect("flows mutex poisoned");
     if let Some(flow) = flows.iter_mut().find(|flow| flow.id == flow_id) {
-        let completed_at = now_millis();
         let storage_tags = body_storage_tags(&response_preview, "response");
-        flow.completed_at = Some(completed_at);
-        flow.duration_ms = Some(completed_at.saturating_sub(started_at));
+        let now = now_millis();
+        if completed {
+            flow.completed_at = Some(now);
+        }
+        flow.duration_ms = Some(now.saturating_sub(started_at));
         flow.response_body_preview = response_preview.preview;
         flow.response_body_text_path = response_preview.text_body_path;
         flow.response_body_preview_truncated = response_preview.preview_truncated;
@@ -4341,11 +4458,11 @@ fn registrable_domain(host: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        buffer_preview, configure_client_stream, host_matches_pattern, is_event_stream_response,
-        is_websocket_upgrade, matching_rule_for_phase, mitm_alpn_protocols,
-        normalize_capture_hosts, poll_blocking_result, rewrite_response_for_rule,
-        should_capture_host, should_mitm_host, streaming_preview_from_bytes,
-        websocket_request_wire, ParsedRequest,
+        buffer_preview, configure_client_stream, decode_chunked_partial, host_matches_pattern,
+        is_event_stream_response, is_websocket_upgrade, matching_rule_for_phase,
+        mitm_alpn_protocols, normalize_capture_hosts, poll_blocking_result,
+        rewrite_response_for_rule, should_capture_host, should_mitm_host,
+        streaming_preview_from_bytes, websocket_request_wire, ParsedRequest,
     };
     use crate::models::ProxyRule;
     use std::collections::HashMap;
@@ -4527,11 +4644,18 @@ mod tests {
 
     #[test]
     fn streaming_preview_marks_truncated_bodies() {
-        let preview = streaming_preview_from_bytes(b"data: ready\n\n", 1024);
+        let preview = streaming_preview_from_bytes(b"data: ready\n\n", 1024, &HashMap::new());
 
         assert_eq!(preview.preview, "data: ready\n\n");
         assert!(preview.preview_truncated);
         assert_eq!(preview.size, 1024);
+    }
+
+    #[test]
+    fn partial_chunked_stream_preview_omits_chunk_frames() {
+        let decoded = decode_chunked_partial(b"d\r\ndata: ready\n\n\r\n10\r\nevent: done\n");
+
+        assert_eq!(String::from_utf8_lossy(&decoded), "data: ready\n\n");
     }
 
     #[test]
