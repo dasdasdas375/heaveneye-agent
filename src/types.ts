@@ -69,6 +69,16 @@ export type SystemProxyStatus = {
   message: string;
 };
 
+export type SseEventCapture = {
+  event: string;
+  id: string;
+  retry: string;
+  data: string;
+  raw: string;
+  arrivedAt: number;
+  complete: boolean;
+};
+
 export type CaptureFlow = {
   id: string;
   startedAt: number;
@@ -96,6 +106,7 @@ export type CaptureFlow = {
   requestSize: number;
   responseSize: number;
   errorType: string;
+  sseEvents?: SseEventCapture[];
   tags: string[];
 };
 

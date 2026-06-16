@@ -5,6 +5,7 @@ export type SseEventRow = {
   retry: string;
   data: string;
   raw: string;
+  arrivedAt?: number;
   complete: boolean;
 };
 

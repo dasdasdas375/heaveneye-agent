@@ -264,6 +264,7 @@ mod tests {
             request_size: 0,
             response_size: 0,
             error_type: String::new(),
+            sse_events: Vec::new(),
             tags: Vec::new(),
         }
     }

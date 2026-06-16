@@ -817,6 +817,7 @@ function compactFlowForStorage(flow: CaptureFlow): CaptureFlow {
     ...flow,
     requestBodyPreview: trimStoredText(flow.requestBodyPreview || ""),
     responseBodyPreview: trimStoredText(flow.responseBodyPreview || ""),
+    sseEvents: Array.isArray(flow.sseEvents) ? flow.sseEvents.slice(-500) : [],
     tags: Array.isArray(flow.tags) ? flow.tags : [],
   };
 }
@@ -824,6 +825,7 @@ function compactFlowForStorage(flow: CaptureFlow): CaptureFlow {
 function normalizeStoredFlow(flow: CaptureFlow): CaptureFlow {
   return {
     ...flow,
+    sseEvents: Array.isArray(flow.sseEvents) ? flow.sseEvents : [],
     tags: Array.isArray(flow.tags) ? flow.tags : [],
     requestBodyPreview: flow.requestBodyPreview || "",
     responseBodyPreview: flow.responseBodyPreview || "",
@@ -1252,6 +1254,18 @@ function InspectorBlock({
   );
 }
 
+function formatEventStreamTime(timestamp?: number) {
+  if (!timestamp) {
+    return "-";
+  }
+  const date = new Date(timestamp);
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  const seconds = String(date.getSeconds()).padStart(2, "0");
+  const milliseconds = String(date.getMilliseconds()).padStart(3, "0");
+  return `${hours}:${minutes}:${seconds}.${milliseconds}`;
+}
+
 function EventStreamPanel({
   events,
   rawContent,
@@ -1324,10 +1338,10 @@ function EventStreamPanel({
         <div className="eventstream-grid">
           <div className="eventstream-list" role="listbox" aria-label="EventStream events">
             <div className="eventstream-list-head">
-              <span>#</span>
-              <span>Event</span>
+              <span>Id</span>
+              <span>Type</span>
               <span>Data</span>
-              <span>ID</span>
+              <span>Time</span>
             </div>
             {events.map((event, index) => (
               <button
@@ -1338,10 +1352,10 @@ function EventStreamPanel({
                 role="option"
                 aria-selected={index === selectedIndex}
               >
-                <span>{event.index}</span>
-                <span>{event.event}</span>
+                <span>{event.id || String(event.index)}</span>
+                <span>{event.event || "message"}</span>
                 <span>{event.data || event.raw || "-"}</span>
-                <span>{event.id || (event.complete ? "-" : "pending")}</span>
+                <span>{event.complete ? formatEventStreamTime(event.arrivedAt) : "pending"}</span>
               </button>
             ))}
           </div>
@@ -1349,6 +1363,7 @@ function EventStreamPanel({
             <div className="eventstream-detail-head">
               <div>
                 <strong>{selectedEvent ? `${selectedEvent.event} #${selectedEvent.index}` : "Event"}</strong>
+                {selectedEvent?.arrivedAt ? <span>{formatEventStreamTime(selectedEvent.arrivedAt)}</span> : null}
                 {selectedEvent && !selectedEvent.complete ? <span>pending</span> : null}
               </div>
               <button
@@ -1410,7 +1425,22 @@ function PayloadSwitcher({
   const responseBodyValue = usableFullResponseBody?.content ?? flow.responseBodyPreview;
   const requestBodyMeta = fullRequestBody ? fullBodyMeta(fullRequestBody) : bodyPreviewMeta(flow, "request");
   const responseBodyMeta = usableFullResponseBody ? fullBodyMeta(usableFullResponseBody) : bodyPreviewMeta(flow, "response");
-  const eventStreamEvents = useMemo(() => parseSseEvents(responseBodyValue || ""), [responseBodyValue]);
+  const eventStreamEvents = useMemo(() => {
+    const capturedEvents = Array.isArray(flow.sseEvents) ? flow.sseEvents : [];
+    if (capturedEvents.length) {
+      return capturedEvents.map((event, index) => ({
+        index: index + 1,
+        event: event.event || "message",
+        id: event.id || "",
+        retry: event.retry || "",
+        data: event.data || "",
+        raw: event.raw || "",
+        arrivedAt: event.arrivedAt,
+        complete: event.complete,
+      }));
+    }
+    return parseSseEvents(responseBodyValue || "");
+  }, [flow.sseEvents, responseBodyValue]);
   const hasQueryParams = Object.keys(queryParams).length > 0;
   const hasRequestBody = Boolean(requestBodyValue);
   const hasRequestPayload = hasQueryParams || hasRequestBody;

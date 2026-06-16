@@ -1,7 +1,7 @@
 use crate::certs::CertificateService;
 use crate::models::{
     AppConfig, BreakpointDecision, BreakpointRequest, CaptureBodyContent, CaptureFlow, ProxyRule,
-    ProxyStatus, WeakNetworkProfile,
+    ProxyStatus, SseEventCapture, WeakNetworkProfile,
 };
 use bytes::Bytes;
 use flate2::read::{GzDecoder, ZlibDecoder};
@@ -1106,6 +1106,7 @@ fn handle_connect(
                             request_size: 0,
                             response_size: 0,
                             error_type: "mitm_setup_error".into(),
+                            sse_events: Vec::new(),
                             tags: tags.clone(),
                         },
                     );
@@ -1181,6 +1182,7 @@ fn handle_connect(
                         request_size: 0,
                         response_size: 0,
                         error_type: String::new(),
+                        sse_events: Vec::new(),
                         tags: tags.clone(),
                     },
                 );
@@ -1228,6 +1230,7 @@ fn handle_connect(
                         request_size: 0,
                         response_size: 0,
                         error_type: "connect_error".into(),
+                        sse_events: Vec::new(),
                         tags,
                     },
                 );
@@ -1321,6 +1324,7 @@ fn handle_forward_http(
                             request_size: request_preview.size as u64,
                             response_size: capture.response_size,
                             error_type: capture.error_type,
+                            sse_events: Vec::new(),
                             tags: capture.tags,
                         },
                     );
@@ -1441,7 +1445,7 @@ fn handle_forward_http(
                         request_body_preview_truncated: request_preview.preview_truncated,
                         request_body_decoded_size: request_preview.decoded_size as u64,
                         request_body_replay_size,
-                        response_body_preview: response_preview.preview,
+                        response_body_preview: response_preview.preview.clone(),
                         response_body_text_path: response_preview.text_body_path,
                         response_body_preview_truncated: response_preview.preview_truncated,
                         response_body_decoded_size: response_preview.decoded_size as u64,
@@ -1454,6 +1458,11 @@ fn handle_forward_http(
                         } else {
                             String::new()
                         },
+                        sse_events: sse_events_for_captured_response(
+                            &parsed_response.headers,
+                            &response_preview.preview,
+                            now_millis(),
+                        ),
                         tags: base_tags,
                     },
                 );
@@ -1501,6 +1510,7 @@ fn handle_forward_http(
                         request_size: request_preview.size as u64,
                         response_size: 0,
                         error_type: "proxy_error".into(),
+                        sse_events: Vec::new(),
                         tags: base_tags,
                     },
                 );
@@ -1567,6 +1577,7 @@ fn push_mitm_failure_flow_if_needed(
             request_size: 0,
             response_size: 0,
             error_type: error_type.into(),
+            sse_events: Vec::new(),
             tags,
         },
     );
@@ -1732,6 +1743,7 @@ fn handle_tls_mitm_connection(
                         request_size: request_preview.size as u64,
                         response_size: capture.response_size,
                         error_type: capture.error_type,
+                        sse_events: Vec::new(),
                         tags: flow_tags,
                     },
                 );
@@ -1827,6 +1839,7 @@ fn handle_tls_mitm_connection(
                                 request_size: request_preview.size as u64,
                                 response_size: 0,
                                 error_type: String::new(),
+                                sse_events: Vec::new(),
                                 tags: flow_tags.clone(),
                             },
                         );
@@ -1963,7 +1976,7 @@ fn handle_tls_mitm_connection(
                     request_body_preview_truncated: request_preview.preview_truncated,
                     request_body_decoded_size: request_preview.decoded_size as u64,
                     request_body_replay_size,
-                    response_body_preview: response_preview.preview,
+                    response_body_preview: response_preview.preview.clone(),
                     response_body_text_path: response_preview.text_body_path,
                     response_body_preview_truncated: response_preview.preview_truncated,
                     response_body_decoded_size: response_preview.decoded_size as u64,
@@ -1976,6 +1989,11 @@ fn handle_tls_mitm_connection(
                     } else {
                         String::new()
                     },
+                    sse_events: sse_events_for_captured_response(
+                        &parsed_response.headers,
+                        &response_preview.preview,
+                        now_millis(),
+                    ),
                     tags: flow_tags,
                 },
             );
@@ -2177,7 +2195,7 @@ fn handle_h2_mitm_connection(
                                 request_body_preview_truncated: request_body.preview_truncated,
                                 request_body_decoded_size: request_body.decoded_size as u64,
                                 request_body_replay_size,
-                                response_body_preview: response_preview.preview,
+                                response_body_preview: response_preview.preview.clone(),
                                 response_body_text_path: response_preview.text_body_path,
                                 response_body_preview_truncated: response_preview.preview_truncated,
                                 response_body_decoded_size: response_preview.decoded_size as u64,
@@ -2190,6 +2208,11 @@ fn handle_h2_mitm_connection(
                                 } else {
                                     String::new()
                                 },
+                                sse_events: sse_events_for_captured_response(
+                                    &parsed_response.headers,
+                                    &response_preview.preview,
+                                    now_millis(),
+                                ),
                                 tags: flow_tags,
                             },
                         );
@@ -2251,6 +2274,7 @@ fn handle_h2_mitm_connection(
                                 request_size: request_body.size as u64,
                                 response_size: error.len() as u64,
                                 error_type: "proxy_error".into(),
+                                sse_events: Vec::new(),
                                 tags: flow_tags,
                             },
                         );
@@ -2496,6 +2520,153 @@ fn streaming_preview_from_bytes(
         preview,
         preview_truncated,
     }
+}
+
+fn parse_sse_events_for_capture(content: &str) -> Vec<SseEventCapture> {
+    let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+    if normalized.trim().is_empty() || normalized.starts_with("[streaming response") {
+        return Vec::new();
+    }
+
+    let mut rows = Vec::new();
+    let mut event = "message".to_string();
+    let mut id = String::new();
+    let mut retry = String::new();
+    let mut data_lines: Vec<String> = Vec::new();
+    let mut raw_lines: Vec<String> = Vec::new();
+
+    for line in normalized.split('\n') {
+        if line.is_empty() {
+            push_sse_event_capture(
+                &mut rows,
+                &mut event,
+                &mut id,
+                &mut retry,
+                &mut data_lines,
+                &mut raw_lines,
+                true,
+            );
+            continue;
+        }
+
+        raw_lines.push(line.to_string());
+        if line.starts_with(':') {
+            continue;
+        }
+
+        let (field, value) = match line.split_once(':') {
+            Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
+            None => (line, ""),
+        };
+
+        match field {
+            "event" => event = if value.is_empty() { "message" } else { value }.to_string(),
+            "data" => data_lines.push(value.to_string()),
+            "id" => id = value.to_string(),
+            "retry" => retry = value.to_string(),
+            _ => {}
+        }
+    }
+
+    push_sse_event_capture(
+        &mut rows,
+        &mut event,
+        &mut id,
+        &mut retry,
+        &mut data_lines,
+        &mut raw_lines,
+        false,
+    );
+
+    rows
+}
+
+fn push_sse_event_capture(
+    rows: &mut Vec<SseEventCapture>,
+    event: &mut String,
+    id: &mut String,
+    retry: &mut String,
+    data_lines: &mut Vec<String>,
+    raw_lines: &mut Vec<String>,
+    complete: bool,
+) {
+    if raw_lines.is_empty()
+        && data_lines.is_empty()
+        && event == "message"
+        && id.is_empty()
+        && retry.is_empty()
+    {
+        return;
+    }
+
+    rows.push(SseEventCapture {
+        event: if event.is_empty() {
+            "message".to_string()
+        } else {
+            event.clone()
+        },
+        id: id.clone(),
+        retry: retry.clone(),
+        data: data_lines.join("\n"),
+        raw: raw_lines.join("\n"),
+        arrived_at: 0,
+        complete,
+    });
+
+    *event = "message".to_string();
+    id.clear();
+    retry.clear();
+    data_lines.clear();
+    raw_lines.clear();
+}
+
+fn merge_sse_event_captures(
+    existing: &[SseEventCapture],
+    preview: &str,
+    arrived_at: u64,
+) -> Vec<SseEventCapture> {
+    if preview.starts_with("[streaming response") {
+        return existing.to_vec();
+    }
+
+    let mut parsed = parse_sse_events_for_capture(preview);
+    if parsed.is_empty() {
+        return existing.to_vec();
+    }
+
+    for (index, event) in parsed.iter_mut().enumerate() {
+        if let Some(previous) = existing
+            .get(index)
+            .filter(|previous| same_sse_event_capture(previous, event))
+        {
+            event.arrived_at = previous.arrived_at;
+        } else {
+            event.arrived_at = arrived_at;
+        }
+    }
+
+    parsed
+}
+
+fn sse_events_for_captured_response(
+    headers: &HashMap<String, String>,
+    preview: &str,
+    arrived_at: u64,
+) -> Vec<SseEventCapture> {
+    if is_event_stream_response(headers) {
+        merge_sse_event_captures(&[], preview, arrived_at)
+    } else {
+        Vec::new()
+    }
+}
+
+fn same_sse_event_capture(left: &SseEventCapture, right: &SseEventCapture) -> bool {
+    left.event == right.event
+        && left.id == right.id
+        && left.retry == right.retry
+        && left.data == right.data
+        && left.raw == right.raw
+        && left.complete == right.complete
 }
 
 fn decode_chunked_partial(body: &[u8]) -> Vec<u8> {
@@ -4181,6 +4352,7 @@ fn update_streaming_flow(
     if let Some(flow) = flows.iter_mut().find(|flow| flow.id == flow_id) {
         let storage_tags = body_storage_tags(&response_preview, "response");
         let now = now_millis();
+        let sse_events = merge_sse_event_captures(&flow.sse_events, &response_preview.preview, now);
         if completed {
             flow.completed_at = Some(now);
         }
@@ -4190,6 +4362,7 @@ fn update_streaming_flow(
         flow.response_body_preview_truncated = response_preview.preview_truncated;
         flow.response_body_decoded_size = response_preview.decoded_size as u64;
         flow.response_size = response_size;
+        flow.sse_events = sse_events;
         if !error_type.is_empty() {
             flow.error_type = error_type;
         }
@@ -4460,9 +4633,10 @@ mod tests {
     use super::{
         buffer_preview, configure_client_stream, decode_chunked_partial, host_matches_pattern,
         is_event_stream_response, is_websocket_upgrade, matching_rule_for_phase,
-        mitm_alpn_protocols, normalize_capture_hosts, poll_blocking_result,
-        rewrite_response_for_rule, should_capture_host, should_mitm_host,
-        streaming_preview_from_bytes, websocket_request_wire, ParsedRequest,
+        merge_sse_event_captures, mitm_alpn_protocols, normalize_capture_hosts,
+        parse_sse_events_for_capture, poll_blocking_result, rewrite_response_for_rule,
+        should_capture_host, should_mitm_host, streaming_preview_from_bytes,
+        websocket_request_wire, ParsedRequest,
     };
     use crate::models::ProxyRule;
     use std::collections::HashMap;
@@ -4656,6 +4830,42 @@ mod tests {
         let decoded = decode_chunked_partial(b"d\r\ndata: ready\n\n\r\n10\r\nevent: done\n");
 
         assert_eq!(String::from_utf8_lossy(&decoded), "data: ready\n\n");
+    }
+
+    #[test]
+    fn parses_sse_events_for_devtools_style_rows() {
+        let events = parse_sse_events_for_capture(
+            "event: progress\nid: 1\ndata: {\"percent\":30}\n\n\
+             data: first\ndata: second\nretry: 1000\n\n",
+        );
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event, "progress");
+        assert_eq!(events[0].id, "1");
+        assert_eq!(events[0].data, "{\"percent\":30}");
+        assert!(events[0].complete);
+        assert_eq!(events[1].event, "message");
+        assert_eq!(events[1].retry, "1000");
+        assert_eq!(events[1].data, "first\nsecond");
+    }
+
+    #[test]
+    fn merges_sse_events_without_rewriting_existing_arrival_times() {
+        let first = merge_sse_event_captures(
+            &[],
+            "event: progress\nid: 1\ndata: {\"percent\":30}\n\n",
+            1000,
+        );
+        let second = merge_sse_event_captures(
+            &first,
+            "event: progress\nid: 1\ndata: {\"percent\":30}\n\n\
+             event: done\nid: 2\ndata: {\"ok\":true}\n\n",
+            2000,
+        );
+
+        assert_eq!(second.len(), 2);
+        assert_eq!(second[0].arrived_at, 1000);
+        assert_eq!(second[1].arrived_at, 2000);
     }
 
     #[test]

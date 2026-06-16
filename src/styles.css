@@ -2242,7 +2242,7 @@ body.workspace-is-resizing * {
 .eventstream-list-head,
 .eventstream-row {
   display: grid;
-  grid-template-columns: 42px minmax(74px, 0.45fr) minmax(0, 1fr) minmax(58px, 0.35fr);
+  grid-template-columns: minmax(56px, 0.35fr) minmax(92px, 0.45fr) minmax(0, 1fr) minmax(104px, 0.45fr);
   align-items: center;
   gap: 8px;
   min-height: 34px;
@@ -2280,6 +2280,10 @@ body.workspace-is-resizing * {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.eventstream-row span:nth-child(3) {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 .eventstream-detail {

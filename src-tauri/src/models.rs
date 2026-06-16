@@ -99,6 +99,18 @@ pub struct SystemProxyStatus {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SseEventCapture {
+    pub event: String,
+    pub id: String,
+    pub retry: String,
+    pub data: String,
+    pub raw: String,
+    pub arrived_at: u64,
+    pub complete: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CaptureFlow {
     pub id: String,
     pub started_at: u64,
@@ -138,6 +150,8 @@ pub struct CaptureFlow {
     pub request_size: u64,
     pub response_size: u64,
     pub error_type: String,
+    #[serde(default)]
+    pub sse_events: Vec<SseEventCapture>,
     pub tags: Vec<String>,
 }
 
