@@ -249,7 +249,7 @@ impl AiService {
                     vec![chat_message(
                         "system",
                         Value::String(
-                            "你是 HeavenEye Agent（天眼抓包 Agent），一个运行在用户本机、面向研发和测试的抓包调试助手。你的职责是替代用户手动翻浏览器 F12 Network：只基于本地抓包上下文和图片证据回答，不要编造，不要输出与抓包证据无关的免责声明、合规说明、风险提醒或注意事项。用户询问账号、uid、token、header、cookie、报错接口、慢接口时，如果抓包上下文中真实存在对应字段，就按字段原文和证据接口列出；如果上下文不足，就明确说明还没有捕获到哪些接口。用户要求接口测试时，先基于真实 request 参数、headers、body 和 response 设计低风险用例，再把可执行的参数变体放入 testCases；每个用例必须相对原请求可发送，不要生成破坏性、扣费、删除、批量写入类用例。必须返回严格 JSON，不要 Markdown，不要代码块。JSON 结构为：{\"summary\":\"一句话结论，优先回答用户最关心的问题\",\"highlights\":[{\"label\":\"账号|密码|Token|UID|报错接口|慢接口等\",\"value\":\"可复制的核心值\",\"kind\":\"uid|account|password|token|error|url|field|status|time|other\",\"source\":\"字段来源，如 requestBody.email 或 responseBody.data.token\"}],\"evidence\":[{\"title\":\"证据名称\",\"time\":\"请求时间\",\"method\":\"GET/POST\",\"status\":200,\"host\":\"域名\",\"path\":\"路径和 query\",\"fields\":[{\"label\":\"字段路径\",\"value\":\"字段值\"}]}],\"analysis\":[\"简短分析或下一步\"],\"testCases\":[{\"name\":\"用例名\",\"purpose\":\"为什么测\",\"method\":\"GET/POST，可省略则沿用原请求\",\"url\":\"完整 URL，可省略则沿用原请求\",\"headers\":{\"x-demo\":\"value，可省略\"},\"query\":{\"key\":\"value，可省略\"},\"body\":{\"字段\":\"值；可省略或字符串\"},\"expected\":\"预期状态/字段/行为\"}]}。highlights 必须只放用户最需要复制的核心元素，并放在最前；evidence 只说明这些值从哪个接口、什么时间、什么状态取到，fields 只放未在 highlights 重复展示的补充字段；非接口测试问题不要返回 testCases，接口测试最多 5 个用例。".into(),
+                            "你是 HeavenEye Agent（天眼抓包 Agent），一个运行在用户本机、面向研发和测试的抓包调试助手。你的职责是替代用户手动翻浏览器 F12 Network：只基于本地抓包上下文和图片证据回答，不要编造，不要输出与抓包证据无关的免责声明、合规说明、风险提醒或注意事项。如果图片证据显示 Chrome F12 Network/EventStream 中存在 SSE，而抓包上下文没有对应 flow，必须明确区分“浏览器 F12 证明页面有 SSE”和“HeavenEye 当前上下文未捕获到这条 SSE”，不要简单回答“没有 SSE”。用户询问账号、uid、token、header、cookie、报错接口、慢接口时，如果抓包上下文中真实存在对应字段，就按字段原文和证据接口列出；如果上下文不足，就明确说明还没有捕获到哪些接口。用户要求接口测试时，先基于真实 request 参数、headers、body 和 response 设计低风险用例，再把可执行的参数变体放入 testCases；每个用例必须相对原请求可发送，不要生成破坏性、扣费、删除、批量写入类用例。必须返回严格 JSON，不要 Markdown，不要代码块。JSON 结构为：{\"summary\":\"一句话结论，优先回答用户最关心的问题\",\"highlights\":[{\"label\":\"账号|密码|Token|UID|报错接口|慢接口等\",\"value\":\"可复制的核心值\",\"kind\":\"uid|account|password|token|error|url|field|status|time|other\",\"source\":\"字段来源，如 requestBody.email 或 responseBody.data.token\"}],\"evidence\":[{\"title\":\"证据名称\",\"time\":\"请求时间\",\"method\":\"GET/POST\",\"status\":200,\"host\":\"域名\",\"path\":\"路径和 query\",\"fields\":[{\"label\":\"字段路径\",\"value\":\"字段值\"}]}],\"analysis\":[\"简短分析或下一步\"],\"testCases\":[{\"name\":\"用例名\",\"purpose\":\"为什么测\",\"method\":\"GET/POST，可省略则沿用原请求\",\"url\":\"完整 URL，可省略则沿用原请求\",\"headers\":{\"x-demo\":\"value，可省略\"},\"query\":{\"key\":\"value，可省略\"},\"body\":{\"字段\":\"值；可省略或字符串\"},\"expected\":\"预期状态/字段/行为\"}]}。highlights 必须只放用户最需要复制的核心元素，并放在最前；evidence 只说明这些值从哪个接口、什么时间、什么状态取到，fields 只放未在 highlights 重复展示的补充字段；非接口测试问题不要返回 testCases，接口测试最多 5 个用例。".into(),
                         ),
                     )],
                     normalize_history(history),
@@ -1260,7 +1260,32 @@ fn summarize_flow(flow: &CaptureFlow) -> Value {
     })
 }
 
-fn question_terms(question: &str) -> (bool, bool, bool, bool) {
+fn is_sse_flow(flow: &CaptureFlow) -> bool {
+    let tags_match = flow
+        .tags
+        .iter()
+        .any(|tag| tag == "sse" || tag == "streaming-response");
+    let response_type = flow
+        .response_headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("content-type"))
+        .map(|(_, value)| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let accept = flow
+        .request_headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("accept"))
+        .map(|(_, value)| value.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    tags_match
+        || response_type.contains("text/event-stream")
+        || accept.contains("text/event-stream")
+        || flow.response_body_preview.starts_with("data:")
+        || flow.response_body_preview.contains("\ndata:")
+}
+
+fn question_terms(question: &str) -> (bool, bool, bool, bool, bool) {
     let text = question.to_ascii_lowercase();
     (
         [
@@ -1283,11 +1308,24 @@ fn question_terms(question: &str) -> (bool, bool, bool, bool) {
         ["今天", "今日", "today"]
             .iter()
             .any(|term| text.contains(term)),
+        [
+            "sse",
+            "eventstream",
+            "event stream",
+            "server-sent",
+            "server sent",
+            "text/event-stream",
+            "stream",
+            "流式",
+            "事件流",
+        ]
+        .iter()
+        .any(|term| text.contains(term)),
     )
 }
 
 fn score_flow_for_question(flow: &CaptureFlow, question: &str, now: u64) -> f64 {
-    let (identity, failure, slow, today) = question_terms(question);
+    let (identity, failure, slow, today, streaming) = question_terms(question);
     let haystack = format!(
         "{} {} {} {} {}",
         flow.method,
@@ -1346,6 +1384,12 @@ fn score_flow_for_question(flow: &CaptureFlow, question: &str, now: u64) -> f64 
     if slow && flow.duration_ms.unwrap_or_default() > 1000 {
         score += 120.0;
     }
+    if streaming && is_sse_flow(flow) {
+        score += 1200.0;
+    }
+    if is_sse_flow(flow) {
+        score += 80.0;
+    }
     if today && is_same_local_day(flow.started_at, now) {
         score += 40.0;
     }
@@ -1390,6 +1434,11 @@ fn build_agent_context(flows: &[CaptureFlow], question: &str) -> Value {
         .filter(|flow| flow.duration_ms.unwrap_or_default() > 1000)
         .cloned()
         .collect();
+    let sse_flows: Vec<CaptureFlow> = sorted
+        .iter()
+        .filter(|flow| is_sse_flow(flow))
+        .cloned()
+        .collect();
     let mut ranked = sorted.clone();
     ranked.sort_by(|left, right| {
         score_flow_for_question(right, question, now)
@@ -1401,6 +1450,7 @@ fn build_agent_context(flows: &[CaptureFlow], question: &str) -> Value {
     let mut seen = std::collections::HashSet::new();
     for flow in ranked
         .into_iter()
+        .chain(sse_flows.clone())
         .chain(failed_flows.clone())
         .chain(slow_flows.clone())
         .chain(today_flows.iter().take(20).cloned())
@@ -1423,8 +1473,11 @@ fn build_agent_context(flows: &[CaptureFlow], question: &str) -> Value {
             "failed": failed_flows.len(),
             "failedToday": today_flows.iter().filter(|flow| flow.status_code.unwrap_or_default() >= 400 || !flow.error_type.is_empty()).count(),
             "slow": slow_flows.len(),
-            "slowToday": today_flows.iter().filter(|flow| flow.duration_ms.unwrap_or_default() > 1000).count()
+            "slowToday": today_flows.iter().filter(|flow| flow.duration_ms.unwrap_or_default() > 1000).count(),
+            "sse": sse_flows.len(),
+            "sseToday": today_flows.iter().filter(|flow| is_sse_flow(flow)).count()
         },
+        "sseFlows": sse_flows.iter().take(12).map(summarize_flow).collect::<Vec<_>>(),
         "identityHints": selected.iter().flat_map(extract_identity_hints).take(80).collect::<Vec<_>>(),
         "flows": selected.iter().map(summarize_flow).collect::<Vec<_>>()
     })
