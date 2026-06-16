@@ -12,7 +12,7 @@ use rustls::{
 };
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufReader, Cursor, Read, Write};
+use std::io::{BufReader, Cursor, ErrorKind, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::Path;
 use std::pin::Pin;
@@ -71,6 +71,13 @@ struct ParsedResponse {
     status_code: u16,
     headers: HashMap<String, String>,
     body: Vec<u8>,
+}
+
+struct OpenHttpsResponse {
+    stream: StreamOwned<ClientConnection, TcpStream>,
+    head: Vec<u8>,
+    parsed: ParsedResponse,
+    remainder: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -1772,7 +1779,91 @@ fn handle_tls_mitm_connection(
             RequestControlOutcome::Forward(forward) => {
                 flow_tags.extend(forward.tags);
                 apply_weak_network_before_upstream(&weak_network);
-                forward_https_request(&forward.request, &forward.target_url)?
+                let upstream_response = open_https_response(&forward.request, &forward.target_url)?;
+                if is_event_stream_response(&upstream_response.parsed.headers) {
+                    flow_tags.push("streaming-response".into());
+                    flow_tags.push("sse".into());
+                    flow_tags.push("ssl-decrypted".into());
+                    let response_headers = upstream_response.parsed.headers.clone();
+                    let status_code = upstream_response.parsed.status_code;
+                    let flow_id_for_update = flow_id.clone();
+                    if should_capture_host(
+                        &host,
+                        &capture_hosts.lock().expect("capture hosts mutex poisoned"),
+                    ) {
+                        let open_preview = streaming_response_open_preview(&response_headers);
+                        push_flow(
+                            &flows,
+                            CaptureFlow {
+                                id: flow_id.clone(),
+                                started_at: request_started_at,
+                                completed_at: None,
+                                method: request.method.clone(),
+                                scheme: "https".into(),
+                                host: host.clone(),
+                                port: Some(port),
+                                path: target_url.path().to_string(),
+                                query: target_url
+                                    .query()
+                                    .map(|query| format!("?{query}"))
+                                    .unwrap_or_default(),
+                                status_code: Some(status_code),
+                                protocol: request.version.clone(),
+                                source: capture_source(client_addr),
+                                client_address: client_address(client_addr),
+                                duration_ms: None,
+                                request_headers,
+                                response_headers: response_headers.clone(),
+                                request_body_preview: request_preview.preview,
+                                request_body_path,
+                                request_body_text_path: request_preview.text_body_path,
+                                request_body_preview_truncated: request_preview.preview_truncated,
+                                request_body_decoded_size: request_preview.decoded_size as u64,
+                                request_body_replay_size,
+                                response_body_preview: open_preview.preview,
+                                response_body_text_path: open_preview.text_body_path,
+                                response_body_preview_truncated: open_preview.preview_truncated,
+                                response_body_decoded_size: open_preview.decoded_size as u64,
+                                request_size: request_preview.size as u64,
+                                response_size: 0,
+                                error_type: String::new(),
+                                tags: flow_tags.clone(),
+                            },
+                        );
+                    }
+
+                    match relay_https_streaming_response(upstream_response, &mut tls_stream) {
+                        Ok((preview_bytes, response_size)) => {
+                            let response_preview =
+                                streaming_preview_from_bytes(&preview_bytes, response_size);
+                            update_streaming_flow(
+                                &flows,
+                                &flow_id_for_update,
+                                request_started_at,
+                                response_preview,
+                                response_size,
+                                String::new(),
+                            );
+                        }
+                        Err(error) => {
+                            update_streaming_flow(
+                                &flows,
+                                &flow_id_for_update,
+                                request_started_at,
+                                streaming_error_preview(&error),
+                                0,
+                                "streaming_response_error".into(),
+                            );
+                            return Err(error);
+                        }
+                    }
+
+                    if request_wants_close(&request) {
+                        break;
+                    }
+                    continue;
+                }
+                read_https_response_to_end(upstream_response)?
             }
         };
         let response_control = apply_response_controls(
@@ -2146,6 +2237,14 @@ fn handle_h2_mitm_connection(
 }
 
 fn forward_https_request(request: &ParsedRequest, target_url: &Url) -> Result<Vec<u8>, String> {
+    let response = open_https_response(request, target_url)?;
+    read_https_response_to_end(response)
+}
+
+fn open_https_response(
+    request: &ParsedRequest,
+    target_url: &Url,
+) -> Result<OpenHttpsResponse, String> {
     let host = target_url
         .host_str()
         .ok_or_else(|| "missing target host".to_string())?
@@ -2193,11 +2292,145 @@ fn forward_https_request(request: &ParsedRequest, target_url: &Url) -> Result<Ve
         .and_then(|_| tls_stream.write_all(&request.body))
         .map_err(|error| error.to_string())?;
 
-    let mut response_bytes = Vec::new();
-    tls_stream
+    let (head, parsed, remainder) = read_http_response_head(&mut tls_stream)?;
+    Ok(OpenHttpsResponse {
+        stream: tls_stream,
+        head,
+        parsed,
+        remainder,
+    })
+}
+
+fn read_https_response_to_end(mut response: OpenHttpsResponse) -> Result<Vec<u8>, String> {
+    let mut response_bytes = response.head;
+    response_bytes.extend_from_slice(&response.remainder);
+    response
+        .stream
         .read_to_end(&mut response_bytes)
         .map_err(|error| error.to_string())?;
     Ok(response_bytes)
+}
+
+fn relay_https_streaming_response(
+    mut response: OpenHttpsResponse,
+    client_stream: &mut StreamOwned<ServerConnection, TcpStream>,
+) -> Result<(Vec<u8>, u64), String> {
+    let _ = response.stream.sock.set_read_timeout(None);
+    client_stream
+        .write_all(&response.head)
+        .map_err(|error| error.to_string())?;
+    let _ = client_stream.flush();
+
+    let mut preview_bytes = Vec::new();
+    let mut response_size = 0u64;
+    if !response.remainder.is_empty() {
+        response_size += response.remainder.len() as u64;
+        append_stream_preview(&mut preview_bytes, &response.remainder);
+        if !write_streaming_bytes(client_stream, &response.remainder)? {
+            return Ok((preview_bytes, response_size));
+        }
+    }
+
+    loop {
+        let mut chunk = [0u8; 8192];
+        match response.stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => {
+                let bytes = &chunk[..read];
+                response_size += read as u64;
+                append_stream_preview(&mut preview_bytes, bytes);
+                if !write_streaming_bytes(client_stream, bytes)? {
+                    break;
+                }
+            }
+            Err(error) if is_disconnect_io_error(&error) => break,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+
+    Ok((preview_bytes, response_size))
+}
+
+fn write_streaming_bytes<W: Write>(writer: &mut W, bytes: &[u8]) -> Result<bool, String> {
+    match writer.write_all(bytes) {
+        Ok(()) => {
+            let _ = writer.flush();
+            Ok(true)
+        }
+        Err(error) if is_disconnect_io_error(&error) => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn append_stream_preview(preview: &mut Vec<u8>, bytes: &[u8]) {
+    if preview.len() >= BODY_PREVIEW_LIMIT {
+        return;
+    }
+    let remaining = BODY_PREVIEW_LIMIT - preview.len();
+    preview.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+}
+
+fn is_disconnect_io_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::BrokenPipe
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::NotConnected
+            | ErrorKind::UnexpectedEof
+    )
+}
+
+fn is_event_stream_response(headers: &HashMap<String, String>) -> bool {
+    header_value(headers, "content-type")
+        .to_ascii_lowercase()
+        .contains("text/event-stream")
+}
+
+fn streaming_response_open_preview(headers: &HashMap<String, String>) -> BufferPreview {
+    let content_type = header_value(headers, "content-type");
+    let preview = format!(
+        "[streaming response open]\ncontent-type: {}\nHeavenEye is forwarding this EventStream response without waiting for it to close.",
+        if content_type.is_empty() {
+            "text/event-stream"
+        } else {
+            content_type.as_str()
+        }
+    );
+    BufferPreview {
+        size: 0,
+        decoded_size: preview.len(),
+        preview,
+        preview_truncated: false,
+        text_body_path: None,
+    }
+}
+
+fn streaming_preview_from_bytes(preview_bytes: &[u8], response_size: u64) -> BufferPreview {
+    let preview = if preview_bytes.is_empty() {
+        "[streaming response completed without captured body bytes]".to_string()
+    } else {
+        String::from_utf8_lossy(preview_bytes).to_string()
+    };
+    let preview_truncated = response_size > preview_bytes.len() as u64;
+    BufferPreview {
+        size: response_size.min(usize::MAX as u64) as usize,
+        decoded_size: preview.len(),
+        text_body_path: store_text_body(preview.as_bytes()),
+        preview,
+        preview_truncated,
+    }
+}
+
+fn streaming_error_preview(error: &str) -> BufferPreview {
+    let preview = format!("[streaming response error]\n{error}");
+    BufferPreview {
+        size: 0,
+        decoded_size: preview.len(),
+        preview,
+        preview_truncated: false,
+        text_body_path: None,
+    }
 }
 
 fn forward_h2_upstream(
@@ -3821,6 +4054,36 @@ fn push_flow(flows: &Arc<Mutex<Vec<CaptureFlow>>>, flow: CaptureFlow) {
     }
 }
 
+fn update_streaming_flow(
+    flows: &Arc<Mutex<Vec<CaptureFlow>>>,
+    flow_id: &str,
+    started_at: u64,
+    response_preview: BufferPreview,
+    response_size: u64,
+    error_type: String,
+) {
+    let mut flows = flows.lock().expect("flows mutex poisoned");
+    if let Some(flow) = flows.iter_mut().find(|flow| flow.id == flow_id) {
+        let completed_at = now_millis();
+        let storage_tags = body_storage_tags(&response_preview, "response");
+        flow.completed_at = Some(completed_at);
+        flow.duration_ms = Some(completed_at.saturating_sub(started_at));
+        flow.response_body_preview = response_preview.preview;
+        flow.response_body_text_path = response_preview.text_body_path;
+        flow.response_body_preview_truncated = response_preview.preview_truncated;
+        flow.response_body_decoded_size = response_preview.decoded_size as u64;
+        flow.response_size = response_size;
+        if !error_type.is_empty() {
+            flow.error_type = error_type;
+        }
+        for tag in storage_tags {
+            if !flow.tags.contains(&tag) {
+                flow.tags.push(tag);
+            }
+        }
+    }
+}
+
 fn next_flow_id() -> String {
     format!("rust-flow-{}", FLOW_COUNTER.fetch_add(1, Ordering::Relaxed))
 }
@@ -4078,9 +4341,10 @@ fn registrable_domain(host: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        buffer_preview, configure_client_stream, host_matches_pattern, is_websocket_upgrade,
-        matching_rule_for_phase, mitm_alpn_protocols, normalize_capture_hosts,
-        poll_blocking_result, rewrite_response_for_rule, should_capture_host, should_mitm_host,
+        buffer_preview, configure_client_stream, host_matches_pattern, is_event_stream_response,
+        is_websocket_upgrade, matching_rule_for_phase, mitm_alpn_protocols,
+        normalize_capture_hosts, poll_blocking_result, rewrite_response_for_rule,
+        should_capture_host, should_mitm_host, streaming_preview_from_bytes,
         websocket_request_wire, ParsedRequest,
     };
     use crate::models::ProxyRule;
@@ -4247,6 +4511,27 @@ mod tests {
     #[test]
     fn mitm_advertises_http1_only() {
         assert_eq!(mitm_alpn_protocols(), vec![b"http/1.1".to_vec()]);
+    }
+
+    #[test]
+    fn detects_event_stream_responses() {
+        let event_stream = HashMap::from([(
+            "content-type".to_string(),
+            "text/event-stream; charset=utf-8".to_string(),
+        )]);
+        let json = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
+
+        assert!(is_event_stream_response(&event_stream));
+        assert!(!is_event_stream_response(&json));
+    }
+
+    #[test]
+    fn streaming_preview_marks_truncated_bodies() {
+        let preview = streaming_preview_from_bytes(b"data: ready\n\n", 1024);
+
+        assert_eq!(preview.preview, "data: ready\n\n");
+        assert!(preview.preview_truncated);
+        assert_eq!(preview.size, 1024);
     }
 
     #[test]
