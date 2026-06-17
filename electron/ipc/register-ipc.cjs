@@ -63,6 +63,14 @@ function registerIpc({ config, proxyService, captureStore, certificateService, q
       attachments: payload.attachments || [],
     }),
   );
+  ipcMain.handle("ai:ask-agent-stream", (_event, payload = {}) =>
+    qwenClient.askAgent({
+      question: payload.question || "",
+      flows: payload.flows || captureStore.list(),
+      history: payload.history || [],
+      attachments: payload.attachments || [],
+    }),
+  );
 }
 
 module.exports = { registerIpc };

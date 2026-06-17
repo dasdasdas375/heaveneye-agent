@@ -656,8 +656,10 @@ fn try_serve_mobile_setup(
                 "content-type".into(),
                 "application/x-ns-proxy-autoconfig; charset=utf-8".into(),
             )]),
-            format!(
-                "function FindProxyForURL(url, host) {{\n  return \"PROXY {lan_ip}:{proxy_port}; DIRECT\";\n}}\n"
+            proxy_pac_script(
+                &proxy_host_for_pac(request, &lan_ip, proxy_port),
+                proxy_port,
+                &config.capture_hosts,
             )
             .into_bytes(),
         ),
@@ -772,6 +774,124 @@ fn split_authority_host_port(value: &str) -> (&str, Option<u16>) {
         }
     }
     (value, None)
+}
+
+fn proxy_host_for_pac(request: &ParsedRequest, lan_ip: &str, proxy_port: u16) -> String {
+    let Some(host_header) = request.headers.get("host") else {
+        return lan_ip.to_string();
+    };
+    let (host, port) = split_authority_host_port(host_header);
+    if port.is_some_and(|port| port != proxy_port) || !is_local_setup_host(host) {
+        return lan_ip.to_string();
+    }
+    if host.eq_ignore_ascii_case("localhost") || host == "::1" {
+        TARGET_HOST_FOR_PAC.to_string()
+    } else {
+        host.to_string()
+    }
+}
+
+const TARGET_HOST_FOR_PAC: &str = "127.0.0.1";
+
+fn proxy_pac_script(proxy_host: &str, proxy_port: u16, capture_hosts: &[String]) -> String {
+    let normalized_hosts = normalize_capture_hosts(capture_hosts);
+    let exact_patterns = normalized_hosts
+        .iter()
+        .map(|host| js_string(host))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let root_patterns = pac_root_domains(&normalized_hosts)
+        .iter()
+        .map(|host| js_string(host))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let brand_patterns = pac_brand_tokens(&normalized_hosts)
+        .iter()
+        .map(|brand| js_string(brand))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let proxy = format!("PROXY {proxy_host}:{proxy_port}; DIRECT");
+
+    format!(
+        r#"function FindProxyForURL(url, host) {{
+  var proxy = {proxy};
+  host = String(host || "").toLowerCase();
+  if (host === "localhost" || host === "127.0.0.1" || host === "::1" || dnsDomainIs(host, ".local")) {{
+    return "DIRECT";
+  }}
+  var patterns = [{exact_patterns}];
+  if (patterns.length === 0) {{
+    return proxy;
+  }}
+  for (var i = 0; i < patterns.length; i++) {{
+    if (matchesCaptureHost(host, patterns[i])) {{
+      return proxy;
+    }}
+  }}
+  var roots = [{root_patterns}];
+  for (var j = 0; j < roots.length; j++) {{
+    if (host === roots[j] || dnsDomainIs(host, "." + roots[j])) {{
+      return proxy;
+    }}
+  }}
+  var brands = [{brand_patterns}];
+  for (var k = 0; k < brands.length; k++) {{
+    if (host.indexOf(brands[k] + "-") === 0 || host.indexOf("." + brands[k] + "-") >= 0 || host.indexOf("-" + brands[k] + ".") >= 0 || host.indexOf("-" + brands[k] + "-") >= 0) {{
+      return proxy;
+    }}
+  }}
+  return "DIRECT";
+}}
+
+function matchesCaptureHost(host, pattern) {{
+  if (!pattern) {{
+    return false;
+  }}
+  if (pattern === "*") {{
+    return true;
+  }}
+  if (pattern.indexOf("*.") === 0) {{
+    pattern = pattern.substring(2);
+  }}
+  return host === pattern || dnsDomainIs(host, "." + pattern);
+}}
+"#,
+        proxy = js_string(&proxy),
+        exact_patterns = exact_patterns,
+        root_patterns = root_patterns,
+        brand_patterns = brand_patterns
+    )
+}
+
+fn pac_root_domains(capture_hosts: &[String]) -> Vec<String> {
+    let mut roots = Vec::new();
+    for host in capture_hosts {
+        if !has_subdomain_depth(host) {
+            continue;
+        }
+        let Some(root) = registrable_domain(host.trim_start_matches("*.")) else {
+            continue;
+        };
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+fn pac_brand_tokens(capture_hosts: &[String]) -> Vec<String> {
+    let mut brands = Vec::new();
+    for root in pac_root_domains(capture_hosts) {
+        let brand = root.split('.').next().unwrap_or_default().to_string();
+        if brand.len() >= 4 && !brands.contains(&brand) {
+            brands.push(brand);
+        }
+    }
+    brands
+}
+
+fn js_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
 }
 
 fn is_local_setup_host(host: &str) -> bool {
@@ -4634,9 +4754,9 @@ mod tests {
         buffer_preview, configure_client_stream, decode_chunked_partial, host_matches_pattern,
         is_event_stream_response, is_websocket_upgrade, matching_rule_for_phase,
         merge_sse_event_captures, mitm_alpn_protocols, normalize_capture_hosts,
-        parse_sse_events_for_capture, poll_blocking_result, rewrite_response_for_rule,
-        should_capture_host, should_mitm_host, streaming_preview_from_bytes,
-        websocket_request_wire, ParsedRequest,
+        parse_sse_events_for_capture, poll_blocking_result, proxy_pac_script,
+        rewrite_response_for_rule, should_capture_host, should_mitm_host,
+        streaming_preview_from_bytes, websocket_request_wire, ParsedRequest,
     };
     use crate::models::ProxyRule;
     use std::collections::HashMap;
@@ -4671,6 +4791,16 @@ mod tests {
         ));
         assert!(host_matches_pattern("cdn.example.test", "app.example.test"));
         assert!(!host_matches_pattern("google.com", "app.example.test"));
+    }
+
+    #[test]
+    fn pac_script_routes_capture_hosts_and_defaults_direct() {
+        let script = proxy_pac_script("127.0.0.1", 9090, &["app.example.test".to_string()]);
+
+        assert!(script.contains("PROXY 127.0.0.1:9090; DIRECT"));
+        assert!(script.contains("\"app.example.test\""));
+        assert!(script.contains("\"example.test\""));
+        assert!(script.contains("return \"DIRECT\""));
     }
 
     #[test]

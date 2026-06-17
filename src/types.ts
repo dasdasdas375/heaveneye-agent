@@ -54,6 +54,11 @@ export type SystemProxySetting = {
   port: number | null;
 };
 
+export type SystemProxyUrlSetting = {
+  enabled: boolean;
+  url: string;
+};
+
 export type SystemProxyStatus = {
   supported: boolean;
   service: string | null;
@@ -62,6 +67,8 @@ export type SystemProxyStatus = {
   http: SystemProxySetting;
   https: SystemProxySetting;
   socks: SystemProxySetting;
+  autoProxy: SystemProxyUrlSetting;
+  autoDiscoveryEnabled: boolean;
   matchesProxy: boolean;
   managedProxyActive: boolean;
   canRestore: boolean;
@@ -207,6 +214,15 @@ export type AiResult = {
     completion_tokens?: number;
     total_tokens?: number;
   } | null;
+};
+
+export type AgentStreamEvent = {
+  streamId: string;
+  phase: "search" | "answer" | "done" | "error" | string;
+  delta: string;
+  done: boolean;
+  model?: string | null;
+  error?: string | null;
 };
 
 export type AgentHighlight = {

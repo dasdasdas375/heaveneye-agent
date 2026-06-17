@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseSseEvents } from "../src/lib/sse";
+import { parseSseEvents, summarizeSseEventData } from "../src/lib/sse";
 
 describe("parseSseEvents", () => {
   it("parses named server-sent events", () => {
@@ -39,5 +39,41 @@ describe("parseSseEvents", () => {
 
   it("does not treat the open placeholder as an event", () => {
     expect(parseSseEvents("[streaming response open]\ncontent-type: text/event-stream")).toEqual([]);
+  });
+
+  it("summarizes structured JSON event data", () => {
+    const summary = summarizeSseEventData(
+      JSON.stringify({
+        task_id: "f067d39e-9232-4063-99cc-b98c2c4f3e6d",
+        input_type: "file",
+        stages: ["parsing", "planning_summary", "planning_outline"],
+        status: "running",
+      }),
+    );
+
+    expect(summary).toMatchObject({
+      kind: "json",
+      shape: "object 4 keys",
+      signal: "status: running",
+    });
+    expect(summary.summary).toContain("task_id: f067d39e");
+    expect(summary.summary).toContain("stages: 3 items");
+    expect(summary.fields).toEqual(
+      expect.arrayContaining([
+        { label: "task_id", value: "f067d39e-9232-4063-99cc-b98c2c4f3e6d" },
+        { label: "input_type", value: "file" },
+        { label: "stages", value: "3 items: parsing, planning_summary, planning_outline" },
+      ]),
+    );
+  });
+
+  it("summarizes plain text event data", () => {
+    const summary = summarizeSseEventData("first token\nsecond token");
+
+    expect(summary).toMatchObject({
+      kind: "text",
+      shape: "text",
+      signal: "first token second token",
+    });
   });
 });
