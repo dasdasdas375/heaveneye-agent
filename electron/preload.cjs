@@ -23,5 +23,6 @@ contextBridge.exposeInMainWorld("packetAgent", {
     compareFlows: (payload) => invoke("ai:compare-flows", payload),
     generateBugReport: (payload) => invoke("ai:generate-bug-report", payload),
     askAgent: (payload) => invoke("ai:ask-agent", payload),
+    askAgentStream: (payload) => invoke("ai:ask-agent-stream", payload),
   },
 });

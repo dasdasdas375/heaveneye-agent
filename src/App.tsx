@@ -60,7 +60,13 @@ import {
   buildRequestUrl,
 } from "./lib/request-export";
 import { buildHarArchive, buildSessionExport } from "./lib/session-export";
-import { parseSseEvents, type SseEventRow } from "./lib/sse";
+import {
+  parseSseEventData,
+  parseSseEvents,
+  summarizeSseEventData,
+  type SseEventDataSummary,
+  type SseEventRow,
+} from "./lib/sse";
 import { formatSpeechRecognitionError, shouldAutoClearError } from "./lib/ui-errors";
 import {
   InspectorPreview,
@@ -71,6 +77,7 @@ import { StructuredAgentAnswer } from "./components/structured-agent-answer";
 import type {
   AgentAttachment,
   AgentChatMessage,
+  AgentStreamEvent,
   AgentTestCase,
   AiConfigUpdate,
   AppConfig,
@@ -1077,6 +1084,13 @@ function formatProxySetting(setting: SystemProxySetting) {
   return `${setting.host || "-"}:${setting.port ?? "-"}`;
 }
 
+function formatAutoProxySetting(setting?: SystemProxyStatus["autoProxy"]) {
+  if (!setting?.enabled) {
+    return "off";
+  }
+  return setting.url || "on";
+}
+
 function byteLabel(value: number) {
   if (value > 1024 * 1024) {
     return `${(value / 1024 / 1024).toFixed(1)} MB`;
@@ -1283,6 +1297,51 @@ function formatEventStreamTime(timestamp?: number) {
   return `${hours}:${minutes}:${seconds}.${milliseconds}`;
 }
 
+function eventStreamDataSize(event: SseEventRow) {
+  return utf8ByteLength(event.data || event.raw || "");
+}
+
+function buildStructuredSseEvent(event: SseEventRow, summary: SseEventDataSummary) {
+  const parsedData = parseSseEventData(event.data);
+
+  return {
+    index: event.index,
+    type: event.event || "message",
+    id: event.id || undefined,
+    retry: event.retry || undefined,
+    complete: event.complete,
+    arrivedAt: event.arrivedAt ? formatEventStreamTime(event.arrivedAt) : undefined,
+    dataKind: summary.kind,
+    shape: summary.shape,
+    signal: summary.signal,
+    summary: summary.summary,
+    fields: summary.fields,
+    data: parsedData.ok ? parsedData.value : event.data || null,
+  };
+}
+
+function buildStructuredSsePayload(
+  flow: CaptureFlow,
+  events: SseEventRow[],
+  summaries: SseEventDataSummary[],
+) {
+  return {
+    flow: {
+      id: flow.id,
+      method: flow.method,
+      host: flow.host,
+      path: `${flow.path}${flow.query || ""}`,
+      statusCode: flow.statusCode,
+      open: !flow.completedAt,
+      responseSize: flow.responseSize,
+    },
+    eventCount: events.length,
+    completeEvents: events.filter((event) => event.complete).length,
+    pendingEvents: events.filter((event) => !event.complete).length,
+    events: events.map((event, index) => buildStructuredSseEvent(event, summaries[index] || summarizeSseEventData(event.data))),
+  };
+}
+
 function EventStreamPanel({
   events,
   rawContent,
@@ -1300,6 +1359,7 @@ function EventStreamPanel({
 }) {
   const [selectedIndex, setSelectedIndex] = useState(0);
   const isOpen = !flow.completedAt;
+  const eventSummaries = useMemo(() => events.map((event) => summarizeSseEventData(event.data)), [events]);
 
   useEffect(() => {
     setSelectedIndex(0);
@@ -1312,9 +1372,16 @@ function EventStreamPanel({
   }, [events.length, selectedIndex]);
 
   const selectedEvent = events[selectedIndex] || null;
+  const selectedSummary = selectedEvent ? eventSummaries[selectedIndex] || summarizeSseEventData(selectedEvent.data) : null;
   const selectedValue = selectedEvent?.data || selectedEvent?.raw || "";
   const selectedFormatted = selectedValue ? formatInspectorContent(selectedValue) : null;
   const rawMeta: InspectorPayloadMeta = bodyPreviewMeta(flow, "response");
+  const structuredPayload = useMemo(
+    () => buildStructuredSsePayload(flow, events, eventSummaries),
+    [eventSummaries, events, flow],
+  );
+  const selectedStructuredValue =
+    selectedEvent && selectedSummary ? buildStructuredSseEvent(selectedEvent, selectedSummary) : null;
   const copyKey = `eventstream-${flow.id}`;
   const selectedCopyKey = selectedEvent ? `eventstream-event-${flow.id}-${selectedEvent.index}` : copyKey;
 
@@ -1342,11 +1409,11 @@ function EventStreamPanel({
             type="button"
             className="inline-code-action"
             disabled={!rawContent.trim()}
-            onClick={() => onExpand("EventStream", rawContent, rawMeta)}
-            title="放大查看 EventStream"
+            onClick={() => onExpand("EventStream 结构化事件", structuredPayload, rawMeta)}
+            title="放大查看结构化 EventStream"
           >
             <Maximize2 size={13} />
-            <span>放大查看</span>
+            <span>结构化查看</span>
           </button>
         </div>
       </div>
@@ -1355,45 +1422,86 @@ function EventStreamPanel({
         <div className="eventstream-grid">
           <div className="eventstream-list" role="listbox" aria-label="EventStream events">
             <div className="eventstream-list-head">
-              <span>Id</span>
-              <span>Type</span>
-              <span>Data</span>
+              <span>#</span>
+              <span>Event</span>
+              <span>Signal</span>
+              <span>Summary</span>
+              <span>Size</span>
               <span>Time</span>
             </div>
-            {events.map((event, index) => (
-              <button
-                key={`${event.index}-${event.id}-${index}`}
-                type="button"
-                className={["eventstream-row", index === selectedIndex ? "selected" : ""].join(" ")}
-                onClick={() => setSelectedIndex(index)}
-                role="option"
-                aria-selected={index === selectedIndex}
-              >
-                <span>{event.id || String(event.index)}</span>
-                <span>{event.event || "message"}</span>
-                <span>{event.data || event.raw || "-"}</span>
-                <span>{event.complete ? formatEventStreamTime(event.arrivedAt) : "pending"}</span>
-              </button>
-            ))}
+            {events.map((event, index) => {
+              const summary = eventSummaries[index] || summarizeSseEventData(event.data);
+              return (
+                <button
+                  key={`${event.index}-${event.id}-${index}`}
+                  type="button"
+                  className={["eventstream-row", index === selectedIndex ? "selected" : ""].join(" ")}
+                  onClick={() => setSelectedIndex(index)}
+                  role="option"
+                  aria-selected={index === selectedIndex}
+                  title={summary.summary}
+                >
+                  <span>{event.index}</span>
+                  <span>{event.event || "message"}</span>
+                  <span className={`eventstream-kind ${summary.kind}`}>{summary.signal}</span>
+                  <span>{summary.summary}</span>
+                  <span>{byteLabel(eventStreamDataSize(event))}</span>
+                  <span>{event.complete ? formatEventStreamTime(event.arrivedAt) : "pending"}</span>
+                </button>
+              );
+            })}
           </div>
           <div className="eventstream-detail">
             <div className="eventstream-detail-head">
               <div>
                 <strong>{selectedEvent ? `${selectedEvent.event} #${selectedEvent.index}` : "Event"}</strong>
+                {selectedSummary ? <span className={`eventstream-kind ${selectedSummary.kind}`}>{selectedSummary.kind}</span> : null}
+                {selectedSummary ? <span>{selectedSummary.shape}</span> : null}
+                {selectedEvent ? <span>{byteLabel(eventStreamDataSize(selectedEvent))}</span> : null}
                 {selectedEvent?.arrivedAt ? <span>{formatEventStreamTime(selectedEvent.arrivedAt)}</span> : null}
                 {selectedEvent && !selectedEvent.complete ? <span>pending</span> : null}
               </div>
-              <button
-                type="button"
-                className="inline-code-action compact"
-                disabled={!selectedValue}
-                onClick={() => onCopy(selectedValue, selectedCopyKey)}
-                title="复制当前事件 data"
-              >
-                <Copy size={13} />
-                <span>{copiedKey === selectedCopyKey ? "已复制" : "复制"}</span>
-              </button>
+              <div className="eventstream-detail-actions">
+                <button
+                  type="button"
+                  className="inline-code-action compact"
+                  disabled={!selectedValue}
+                  onClick={() => onCopy(selectedValue, selectedCopyKey)}
+                  title="复制当前事件 data"
+                >
+                  <Copy size={13} />
+                  <span>{copiedKey === selectedCopyKey ? "已复制" : "复制"}</span>
+                </button>
+                <button
+                  type="button"
+                  className="inline-code-action compact"
+                  disabled={!selectedStructuredValue}
+                  onClick={() =>
+                    selectedStructuredValue &&
+                    onExpand(`EventStream ${selectedEvent?.event || "event"} #${selectedEvent?.index || ""}`, selectedStructuredValue, rawMeta)
+                  }
+                  title="放大查看当前事件"
+                >
+                  <Maximize2 size={13} />
+                  <span>放大</span>
+                </button>
+              </div>
             </div>
+            {selectedSummary ? (
+              <div className="eventstream-detail-summary">
+                <div className="eventstream-summary-line">{selectedSummary.summary}</div>
+                {selectedSummary.fields.length ? (
+                  <div className="eventstream-field-strip">
+                    {selectedSummary.fields.map((field) => (
+                      <span key={`${field.label}-${field.value}`} className="eventstream-field-chip" title={`${field.label}: ${field.value}`}>
+                        <b>{field.label}</b>
+                        <code>{field.value}</code>
+                      </span>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
             {selectedFormatted ? (
               <InspectorPreview
                 content={selectedFormatted.content}
@@ -1758,7 +1866,7 @@ function findFlowMentionedInText(text: string, candidates: CaptureFlow[]) {
       const path = normalizeLookupText(`${flow.path}${flow.query || ""}`);
       const fullPath = normalizeLookupText(`${flow.host}${flow.path}${flow.query || ""}`);
       return (
-        (requestName.length >= 4 && normalizedText.includes(requestName)) ||
+        (requestName.length >= 6 && normalizedText.includes(requestName)) ||
         (path.length >= 5 && normalizedText.includes(path)) ||
         (fullPath.length >= 8 && normalizedText.includes(fullPath))
       );
@@ -1786,7 +1894,7 @@ function buildFocusedAgentQuestion(question: string, flow: CaptureFlow | null) {
   return [
     question,
     "",
-    "用户在接口列表中显式点选了下面这个接口，请优先围绕它回答，不要改分析到同名或其它慢接口，除非明确说明是在对比：",
+    "用户本轮明确指向了下面这个接口，请优先围绕它回答；不要改分析到同名、旧的 SSE 或其它慢接口，除非明确说明是在对比：",
     `flowId: ${flow.id}`,
     `requestName: ${displayRequestName(flow)}`,
     `method: ${flow.method}`,
@@ -1796,18 +1904,96 @@ function buildFocusedAgentQuestion(question: string, flow: CaptureFlow | null) {
   ].join("\n");
 }
 
-function prioritizeAgentFlows(flows: CaptureFlow[], focusedFlow: CaptureFlow | null) {
-  if (!focusedFlow) {
-    return flows;
-  }
-  return flows.map((flow) =>
-    flow.id === focusedFlow.id
-      ? {
-          ...flow,
-          tags: Array.from(new Set([...(Array.isArray(flow.tags) ? flow.tags : []), "selected", "selected-by-user"])),
-        }
-      : flow,
+function hasContextualAgentReference(question: string) {
+  const normalizedText = normalizeLookupText(question);
+  return (
+    /这个|这条|当前|刚才|上面|下面|这里|这页|这张图|截图|页面|它/.test(question) ||
+    /\b(this|that|current|previous|above|screenshot|page)\b/i.test(normalizedText)
   );
+}
+
+function recentAgentImageAttachments(messages: AgentChatMessage[], question: string) {
+  if (!hasContextualAgentReference(question)) {
+    return [];
+  }
+  return (
+    [...messages]
+      .reverse()
+      .find((message) => message.role === "user" && message.attachments?.some((item) => item.type.startsWith("image/")))
+      ?.attachments?.filter((item) => item.type.startsWith("image/"))
+      .slice(0, 1) || []
+  );
+}
+
+function isUploadQuestion(text: string) {
+  return /上传|上传文件|文件上传|传文件|upload|file upload|attachment|multipart/i.test(text);
+}
+
+function isUploadLikeFlow(flow: CaptureFlow) {
+  if (!["POST", "PUT", "PATCH"].includes(flow.method.toUpperCase())) {
+    return false;
+  }
+  const requestType = String(flow.requestHeaders["content-type"] || flow.requestHeaders["Content-Type"] || "").toLowerCase();
+  const haystack = flowLookupText(flow) + " " + normalizeLookupText(`${requestType} ${flow.requestBodyPreview} ${flow.responseBodyPreview}`);
+  return (
+    requestType.includes("multipart") ||
+    requestType.includes("octet-stream") ||
+    /upload|file|files|attachment|material|avatar|image|cover|media|object|oss|cos|s3/.test(haystack)
+  );
+}
+
+function isStaticAssetFlow(flow: CaptureFlow) {
+  const path = flow.path.toLowerCase();
+  const contentType = String(flow.responseHeaders["content-type"] || flow.responseHeaders["Content-Type"] || "").toLowerCase();
+  return (
+    /\.(png|jpe?g|svg|gif|webp|css|js|woff2?|ttf|mp4|webm|mov|m4a|mp3)$/i.test(path) ||
+    contentType.startsWith("image/") ||
+    contentType.startsWith("video/") ||
+    contentType.includes("font")
+  );
+}
+
+function agentFlowScore(flow: CaptureFlow, question: string, focusedFlow: CaptureFlow | null, hasImages: boolean) {
+  let score = Number(flow.startedAt || 0) / 1_000_000_000_000;
+  const lookup = flowLookupText(flow);
+  const normalizedQuestion = normalizeLookupText(question);
+  if (focusedFlow?.id === flow.id) score += 10_000;
+  if (flow.path && normalizedQuestion.includes(normalizeLookupText(flow.path))) score += 500;
+  if (flow.host && normalizedQuestion.includes(normalizeLookupText(flow.host))) score += 150;
+  if (/报错|错误|失败|异常|error|fail|status|404|401|403|500|502/.test(normalizedQuestion) && (flow.errorType || Number(flow.statusCode || 0) >= 400)) score += 260;
+  if (/慢|耗时|瓶颈|卡|timeout|slow|duration|latency/.test(normalizedQuestion) && Number(flow.durationMs || 0) > 1000) score += 180;
+  if (/uid|user|用户|账号|账户|登录|login|account|current|profile|me/.test(normalizedQuestion) && /current|login|auth|user|account|profile|session|me|subscriptions/.test(lookup)) score += 160;
+  if (isUploadQuestion(question) && isUploadLikeFlow(flow)) score += 420;
+  if (hasImages && !isStaticAssetFlow(flow)) score += 40;
+  if (/json|xhr|api/.test(lookup)) score += 28;
+  if (isStaticAssetFlow(flow) && !(flow.errorType || Number(flow.statusCode || 0) >= 400)) score -= 180;
+  return score;
+}
+
+function prioritizeAgentFlows(
+  flows: CaptureFlow[],
+  focusedFlow: CaptureFlow | null,
+  question = "",
+  hasImages = false,
+) {
+  void question;
+  void hasImages;
+  const limit = 100;
+  return flows
+    .map((flow) =>
+      focusedFlow?.id === flow.id
+        ? {
+            ...flow,
+            tags: Array.from(new Set([...(Array.isArray(flow.tags) ? flow.tags : []), "selected", "selected-by-user"])),
+          }
+        : flow,
+    )
+    .sort((left, right) => {
+      if (focusedFlow?.id === left.id) return -1;
+      if (focusedFlow?.id === right.id) return 1;
+      return Number(right.startedAt || 0) - Number(left.startedAt || 0);
+    })
+    .slice(0, limit)
 }
 
 function findLikelyFlowForQuestion(text: string, candidates: CaptureFlow[]) {
@@ -1834,6 +2020,10 @@ function findLikelyFlowForQuestion(text: string, candidates: CaptureFlow[]) {
         flowLookupText(flow).match(/current|login|auth|user|account|profile|session|me|subscriptions/),
       ) || null
     );
+  }
+
+  if (isUploadQuestion(text)) {
+    return candidates.find(isUploadLikeFlow) || null;
   }
 
   return null;
@@ -2278,6 +2468,33 @@ function readFileAsDataUrl(file: File) {
   });
 }
 
+async function readAgentImageAsDataUrl(file: File) {
+  if (file.size <= 1.2 * 1024 * 1024) {
+    return readFileAsDataUrl(file);
+  }
+
+  try {
+    const bitmap = await createImageBitmap(file);
+    const maxEdge = 1600;
+    const scale = Math.min(1, maxEdge / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+    const context = canvas.getContext("2d");
+    if (!context) {
+      bitmap.close?.();
+      return readFileAsDataUrl(file);
+    }
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    bitmap.close?.();
+    return canvas.toDataURL("image/jpeg", 0.82);
+  } catch {
+    return readFileAsDataUrl(file);
+  }
+}
+
 async function writeTextToClipboard(value: string) {
   try {
     await navigator.clipboard.writeText(value);
@@ -2298,6 +2515,22 @@ async function writeTextToClipboard(value: string) {
     if (!copied) {
       throw error;
     }
+  }
+}
+
+async function listenAgentStream(
+  streamId: string,
+  onEvent: (event: AgentStreamEvent) => void,
+) {
+  try {
+    const { listen } = await import("@tauri-apps/api/event");
+    return await listen<AgentStreamEvent>("agent-answer-stream", (event) => {
+      if (event.payload?.streamId === streamId) {
+        onEvent(event.payload);
+      }
+    });
+  } catch {
+    return null;
   }
 }
 
@@ -2331,6 +2564,32 @@ function AgentThinkingCard({ copy, onCancel }: { copy: AppCopy; onCancel?: () =>
         {steps.map((step) => (
           <span key={step}>{step}</span>
         ))}
+      </div>
+    </div>
+  );
+}
+
+function AgentStreamingAnswer({
+  content,
+  copy,
+  onCancel,
+}: {
+  content: string;
+  copy: AppCopy;
+  onCancel?: () => void;
+}) {
+  return (
+    <div className="agent-streaming-answer" role="status" aria-live="polite">
+      <AgentTextAnswer content={content} />
+      <div className="streaming-status">
+        <Loader2 size={13} />
+        <span>{copy.thinkingStepAnswer}</span>
+        {onCancel ? (
+          <button type="button" onClick={onCancel}>
+            <X size={12} />
+            <span>{copy.cancelAgent}</span>
+          </button>
+        ) : null}
       </div>
     </div>
   );
@@ -2960,6 +3219,9 @@ export function App() {
     await runAction("capture-hosts", async () => {
       const nextStatus = await desktopBackend.proxy.setCaptureHosts({ hosts: domainInput });
       setStatus(nextStatus);
+      if (nextStatus.running && systemProxy?.matchesProxy) {
+        setSystemProxy(await desktopBackend.systemProxy.apply());
+      }
       await desktopBackend.proxy.clear();
       setFlows([]);
       setSelectedId(null);
@@ -3359,7 +3621,11 @@ export function App() {
 
   async function sendAgentQuestion(questionOverride?: string, attachmentOverride?: AgentAttachment[]) {
     const question = (questionOverride ?? agentInput).trim();
-    const attachments = attachmentOverride ?? agentAttachments;
+    const composerAttachments = attachmentOverride ?? agentAttachments;
+    const contextualAttachments = composerAttachments.length
+      ? composerAttachments
+      : recentAgentImageAttachments(agentMessages, question);
+    const inheritedImageContext = !composerAttachments.length && contextualAttachments.length > 0;
     if (busyAction !== null) {
       setError(copy.contextBusy);
       return;
@@ -3375,24 +3641,37 @@ export function App() {
         : null;
     const typedMentionFlow = findFlowMentionedInText(question, flows);
     const focusedFlow = explicitlyMentionedFlow || typedMentionFlow;
-    const preselectedFlow = focusedFlow || findLikelyFlowForQuestion(question, flows);
+    const preselectedFlow = focusedFlow;
     if (preselectedFlow) {
       revealFlowInRequestList(preselectedFlow.id, { clearFilterIfHidden: true });
     }
-    if (await runLocalAgentCommand(question, attachments, focusedFlow || preselectedFlow || selectedFlow)) {
+    if (await runLocalAgentCommand(question, composerAttachments, focusedFlow || preselectedFlow || selectedFlow)) {
       return;
     }
+    const shouldStreamAgentAnswer = !isApiTestCommand(question);
     const focusedAgentQuestion = buildFocusedAgentQuestion(question, focusedFlow);
     const agentQuestion = isApiTestCommand(question)
       ? buildApiTestAgentQuestion(focusedAgentQuestion)
       : focusedAgentQuestion;
-    const agentFlows = prioritizeAgentFlows(flows, focusedFlow);
+    const agentQuestionWithContext = inheritedImageContext
+      ? [
+          agentQuestion,
+          "",
+          "本轮用户没有上传新截图；前端已附带最近一轮用户截图作为追问视觉上下文。请重新读取这张图，不要只沿用上一轮助手结论。",
+        ].join("\n")
+      : agentQuestion;
+    const agentFlows = prioritizeAgentFlows(
+      flows,
+      focusedFlow,
+      agentQuestionWithContext,
+      contextualAttachments.some((item) => item.type.startsWith("image/")),
+    );
 
     const userMessage: AgentChatMessage = {
       id: makeId("user"),
       role: "user",
       content: question,
-      attachments,
+      attachments: composerAttachments,
     };
     const history = agentMessages;
     const pendingMessageId = makeId("assistant-loading");
@@ -3408,17 +3687,57 @@ export function App() {
     setAgentMessages((current) => [...current, userMessage, pendingMessage]);
     clearAgentComposer();
 
+    const streamId = makeId("agent-stream");
+    let streamContent = "";
+    const unlisten = shouldStreamAgentAnswer
+      ? await listenAgentStream(streamId, (event) => {
+          if (isAgentRunCancelled(runId)) {
+            return;
+          }
+          if (event.error) {
+            replaceAgentMessage(pendingMessageId, {
+              status: "error",
+              content: event.error,
+            });
+            return;
+          }
+          if (event.phase === "answer" && event.delta) {
+            streamContent += event.delta;
+            replaceAgentMessage(pendingMessageId, {
+              content: streamContent,
+              model: event.model || config?.qwen.model || "Agent",
+            });
+            return;
+          }
+          if (event.phase === "search" && event.delta && !streamContent) {
+            replaceAgentMessage(pendingMessageId, {
+              content: event.delta,
+              model: event.model || config?.qwen.model || "Agent",
+            });
+          }
+        })
+      : null;
+
     const result = await runAction(
       "ask-agent",
       () =>
-        desktopBackend.ai.askAgent({
-          question: agentQuestion,
-          flows: agentFlows,
-          history,
-          attachments,
-        }),
+        shouldStreamAgentAnswer
+          ? desktopBackend.ai.askAgentStream({
+              streamId,
+              question: agentQuestionWithContext,
+              flows: agentFlows,
+              history,
+              attachments: contextualAttachments.filter((item) => item.type.startsWith("image/")).slice(0, 1),
+            })
+          : desktopBackend.ai.askAgent({
+              question: agentQuestionWithContext,
+              flows: agentFlows,
+              history,
+              attachments: contextualAttachments.filter((item) => item.type.startsWith("image/")).slice(0, 1),
+            }),
       { minimumMs: 420 },
     );
+    unlisten?.();
 
     if (isAgentRunCancelled(runId)) {
       return;
@@ -3440,7 +3759,7 @@ export function App() {
       const evidenceFlow =
         focusedFlow ||
         findFlowFromStructuredAnswer(assistantMessage, flows) ||
-        findLikelyFlowForQuestion(`${question}\n${assistantMessage.content}`, flows);
+        (contextualAttachments.length ? null : findLikelyFlowForQuestion(`${question}\n${assistantMessage.content}`, flows));
       if (evidenceFlow) {
         revealFlowInRequestList(evidenceFlow.id, { clearFilterIfHidden: true });
       }
@@ -3481,20 +3800,20 @@ export function App() {
       const nextAttachments = await Promise.all(
         files
           .filter((file) => file.type.startsWith("image/"))
-          .slice(0, 4)
+          .slice(0, 1)
           .map(async (file) => {
-            if (file.size > 4 * 1024 * 1024) {
-              throw new Error(`${file.name} exceeds the 4 MB image limit.`);
+            if (file.size > 8 * 1024 * 1024) {
+              throw new Error(`${file.name} exceeds the 8 MB image limit.`);
             }
             return {
               id: makeId("image"),
               name: file.name,
               type: file.type,
-              dataUrl: await readFileAsDataUrl(file),
+              dataUrl: await readAgentImageAsDataUrl(file),
             };
           }),
       );
-      setAgentAttachments((current) => [...current, ...nextAttachments].slice(0, 4));
+      setAgentAttachments((current) => [...current, ...nextAttachments].slice(0, 1));
     } catch (fileError) {
       setError(fileError instanceof Error ? fileError.message : String(fileError));
     }
@@ -4210,8 +4529,8 @@ export function App() {
               {status.running ? (
                 <span>
                   系统代理未接入当前抓包端口。{systemProxy.service ? `${systemProxy.service} ` : ""}
-                  HTTP {formatProxySetting(systemProxy.http)} / HTTPS {formatProxySetting(systemProxy.https)} / SOCKS{" "}
-                  {formatProxySetting(systemProxy.socks)}
+                  PAC {formatAutoProxySetting(systemProxy.autoProxy)} / HTTP {formatProxySetting(systemProxy.http)} / HTTPS{" "}
+                  {formatProxySetting(systemProxy.https)} / SOCKS {formatProxySetting(systemProxy.socks)}
                 </span>
               ) : (
                 <span>
@@ -5241,7 +5560,13 @@ export function App() {
                     <span>{message.role === "user" ? "You" : message.model || config?.qwen.model || "Agent"}</span>
                     {message.attachments?.length ? <span>{message.attachments.length} image</span> : null}
                   </div>
-                  {message.status === "loading" ? (
+                  {message.status === "loading" && message.role === "assistant" && message.content && message.content !== copy.thinkingTitle ? (
+                    <AgentStreamingAnswer
+                      content={message.content}
+                      copy={copy}
+                      onCancel={activeAgentRunId ? cancelAgentRun : undefined}
+                    />
+                  ) : message.status === "loading" ? (
                     <AgentThinkingCard copy={copy} onCancel={activeAgentRunId ? cancelAgentRun : undefined} />
                   ) : message.role === "assistant" && message.structured ? (
                     <StructuredAgentAnswer

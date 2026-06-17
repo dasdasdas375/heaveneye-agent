@@ -1,8 +1,11 @@
-use crate::models::{SystemProxySetting, SystemProxyStatus};
+use crate::models::{SystemProxySetting, SystemProxyStatus, SystemProxyUrlSetting};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
+use url::Url;
 
 const TARGET_HOST: &str = "127.0.0.1";
 const WINDOWS_SERVICE_NAME: &str = "Windows Current User Proxy";
@@ -22,6 +25,10 @@ struct SystemProxySnapshot {
     socks: SystemProxySetting,
     #[serde(default)]
     windows: Option<WindowsProxySnapshot>,
+    #[serde(default = "empty_url_setting")]
+    auto_proxy: SystemProxyUrlSetting,
+    #[serde(default)]
+    auto_discovery_enabled: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -49,10 +56,24 @@ impl SystemProxyManager {
         let http = get_proxy_setting(&service, "-getwebproxy")?;
         let https = get_proxy_setting(&service, "-getsecurewebproxy")?;
         let socks = get_proxy_setting(&service, "-getsocksfirewallproxy")?;
-        Ok(self.build_status(service, target_port, http, https, socks))
+        let auto_proxy = get_auto_proxy_setting(&service)?;
+        let auto_discovery_enabled = get_auto_discovery_enabled(&service)?;
+        Ok(self.build_status(
+            service,
+            target_port,
+            http,
+            https,
+            socks,
+            auto_proxy,
+            auto_discovery_enabled,
+        ))
     }
 
-    pub fn apply(&self, target_port: u16) -> Result<SystemProxyStatus, String> {
+    pub fn apply(
+        &self,
+        target_port: u16,
+        capture_hosts: &[String],
+    ) -> Result<SystemProxyStatus, String> {
         if cfg!(target_os = "windows") {
             return self.apply_windows(target_port);
         }
@@ -68,18 +89,64 @@ impl SystemProxyManager {
                 https: get_proxy_setting(&service, "-getsecurewebproxy")?,
                 socks: get_proxy_setting(&service, "-getsocksfirewallproxy")?,
                 windows: None,
+                auto_proxy: get_auto_proxy_setting(&service)?,
+                auto_discovery_enabled: get_auto_discovery_enabled(&service)?,
             };
             self.write_snapshot(&snapshot)?;
         }
 
-        let port = target_port.to_string();
-        run_networksetup(&["-setwebproxy", &service, TARGET_HOST, &port])?;
-        run_networksetup(&["-setwebproxystate", &service, "on"])?;
-        run_networksetup(&["-setsecurewebproxy", &service, TARGET_HOST, &port])?;
-        run_networksetup(&["-setsecurewebproxystate", &service, "on"])?;
+        let pac_url = desktop_pac_url(target_port, capture_hosts);
+        run_networksetup(&["-setwebproxystate", &service, "off"])?;
+        run_networksetup(&["-setsecurewebproxystate", &service, "off"])?;
         let _ = run_networksetup(&["-setsocksfirewallproxystate", &service, "off"]);
+        let _ = run_networksetup(&["-setproxyautodiscovery", &service, "off"]);
+        run_networksetup(&["-setautoproxyurl", &service, &pac_url])?;
+        run_networksetup(&["-setautoproxystate", &service, "on"])?;
 
         self.status(target_port)
+    }
+
+    pub fn cleanup_stale(&self, target_port: u16) -> Result<SystemProxyStatus, String> {
+        if !cfg!(target_os = "macos") {
+            return Ok(self.unsupported_status(target_port));
+        }
+
+        if local_proxy_reachable(target_port) {
+            return self.status(target_port);
+        }
+
+        if self.count_matching_proxies(target_port, None)? == 0 {
+            let _ = fs::remove_file(&self.snapshot_path);
+            return self.status(target_port);
+        }
+
+        if self.snapshot_path.exists() {
+            match self.restore(target_port) {
+                Ok(mut status) => {
+                    status.message = format!("检测到上次代理进程已不可用，{}", status.message);
+                    return Ok(status);
+                }
+                Err(error) => {
+                    let cleaned = self.disable_matching_proxies(target_port, None)?;
+                    let _ = fs::remove_file(&self.snapshot_path);
+                    let mut status = self.status(target_port)?;
+                    status.message = if cleaned > 0 {
+                        format!("系统代理快照恢复失败（{error}），已清理 {cleaned} 项遗留代理。")
+                    } else {
+                        format!("系统代理快照恢复失败（{error}），未发现遗留代理。")
+                    };
+                    return Ok(status);
+                }
+            }
+        }
+
+        let cleaned = self.disable_matching_proxies(target_port, None)?;
+        let mut status = self.status(target_port)?;
+        if cleaned > 0 {
+            status.message =
+                format!("已清理 {cleaned} 项遗留的 {TARGET_HOST}:{target_port} 系统代理。");
+        }
+        Ok(status)
     }
 
     pub fn restore(&self, target_port: u16) -> Result<SystemProxyStatus, String> {
@@ -91,8 +158,13 @@ impl SystemProxyManager {
         }
 
         let Some(snapshot) = self.read_snapshot()? else {
+            let cleaned = self.disable_matching_proxies(target_port, None)?;
             let mut status = self.status(target_port)?;
-            status.message = "没有可恢复的系统代理快照。".to_string();
+            status.message = if cleaned > 0 {
+                format!("没有可恢复的系统代理快照，已清理 {cleaned} 项遗留代理。")
+            } else {
+                "没有可恢复的系统代理快照。".to_string()
+            };
             return Ok(status);
         };
 
@@ -114,10 +186,28 @@ impl SystemProxyManager {
             "-setsocksfirewallproxystate",
             &snapshot.socks,
         )?;
+        restore_auto_proxy(&snapshot.service, &snapshot.auto_proxy)?;
+        run_networksetup(&[
+            "-setproxyautodiscovery",
+            &snapshot.service,
+            if snapshot.auto_discovery_enabled {
+                "on"
+            } else {
+                "off"
+            },
+        ])?;
 
         let _ = fs::remove_file(&self.snapshot_path);
+        let cleaned = self.disable_matching_proxies(target_port, Some(&snapshot.service))?;
         let mut status = self.status(target_port)?;
-        status.message = format!("已恢复 {} 的系统代理设置。", snapshot.service);
+        status.message = if cleaned > 0 {
+            format!(
+                "已恢复 {} 的系统代理设置，并清理 {cleaned} 项其它服务上的遗留代理。",
+                snapshot.service
+            )
+        } else {
+            format!("已恢复 {} 的系统代理设置。", snapshot.service)
+        };
         Ok(status)
     }
 
@@ -132,6 +222,8 @@ impl SystemProxyManager {
             http,
             https,
             socks,
+            empty_url_setting(),
+            false,
         ))
     }
 
@@ -143,6 +235,8 @@ impl SystemProxyManager {
                 https: empty_setting(),
                 socks: empty_setting(),
                 windows: Some(read_windows_proxy_snapshot()?),
+                auto_proxy: empty_url_setting(),
+                auto_discovery_enabled: false,
             };
             self.write_snapshot(&snapshot)?;
         }
@@ -177,22 +271,32 @@ impl SystemProxyManager {
         http: SystemProxySetting,
         https: SystemProxySetting,
         socks: SystemProxySetting,
+        auto_proxy: SystemProxyUrlSetting,
+        auto_discovery_enabled: bool,
     ) -> SystemProxyStatus {
         let http_matches = setting_matches(&http, target_port);
         let https_matches = setting_matches(&https, target_port);
         let socks_matches = setting_matches(&socks, target_port);
-        let matches_proxy = http_matches && https_matches && !socks.enabled;
-        let managed_proxy_active = http_matches || https_matches || socks_matches;
-        let can_restore = self.snapshot_path.exists();
-        let restore_recommended = can_restore && managed_proxy_active;
+        let auto_proxy_matches = auto_proxy_matches(&auto_proxy, target_port);
+        let matches_proxy = auto_proxy_matches || (http_matches && https_matches && !socks.enabled);
+        let managed_proxy_active =
+            http_matches || https_matches || socks_matches || auto_proxy_matches;
+        let can_restore = self.snapshot_path.exists() || managed_proxy_active;
+        let restore_recommended = managed_proxy_active;
         let message = if matches_proxy {
-            format!("系统代理已指向 {TARGET_HOST}:{target_port}。")
+            if auto_proxy_matches {
+                format!("系统 PAC 已按目标域名接入 {TARGET_HOST}:{target_port}。")
+            } else {
+                format!("系统代理已指向 {TARGET_HOST}:{target_port}。")
+            }
         } else if restore_recommended {
             format!("检测到上次留下的系统代理仍指向 {TARGET_HOST}:{target_port}，建议恢复原设置。")
+        } else if auto_proxy.enabled {
+            "系统 PAC 使用的是其它地址，浏览器流量可能没有进入当前抓包代理。".to_string()
         } else if socks.enabled {
             "SOCKS 代理仍处于开启状态，浏览器流量可能没有进入当前抓包代理。".to_string()
         } else {
-            format!("系统 HTTP/HTTPS 代理未同时指向 {TARGET_HOST}:{target_port}。")
+            format!("系统 PAC/HTTP/HTTPS 代理未接入 {TARGET_HOST}:{target_port}。")
         };
 
         SystemProxyStatus {
@@ -203,6 +307,8 @@ impl SystemProxyManager {
             http,
             https,
             socks,
+            auto_proxy,
+            auto_discovery_enabled,
             matches_proxy,
             managed_proxy_active,
             can_restore,
@@ -220,6 +326,8 @@ impl SystemProxyManager {
             http: empty_setting(),
             https: empty_setting(),
             socks: empty_setting(),
+            auto_proxy: empty_url_setting(),
+            auto_discovery_enabled: false,
             matches_proxy: false,
             managed_proxy_active: false,
             can_restore: false,
@@ -245,6 +353,83 @@ impl SystemProxyManager {
             .map(Some)
             .map_err(|error| format!("系统代理快照无法读取：{error}"))
     }
+
+    fn disable_matching_proxies(
+        &self,
+        target_port: u16,
+        preserve_service: Option<&str>,
+    ) -> Result<usize, String> {
+        let mut changed = 0;
+        for service in network_services()? {
+            if preserve_service
+                .map(|preserved| service_names_match(preserved, &service))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            let http = get_proxy_setting(&service, "-getwebproxy")?;
+            if setting_matches(&http, target_port) {
+                run_networksetup(&["-setwebproxystate", &service, "off"])?;
+                changed += 1;
+            }
+
+            let https = get_proxy_setting(&service, "-getsecurewebproxy")?;
+            if setting_matches(&https, target_port) {
+                run_networksetup(&["-setsecurewebproxystate", &service, "off"])?;
+                changed += 1;
+            }
+
+            let socks = get_proxy_setting(&service, "-getsocksfirewallproxy")?;
+            if setting_matches(&socks, target_port) {
+                run_networksetup(&["-setsocksfirewallproxystate", &service, "off"])?;
+                changed += 1;
+            }
+
+            let auto_proxy = get_auto_proxy_setting(&service)?;
+            if auto_proxy_matches(&auto_proxy, target_port) {
+                run_networksetup(&["-setautoproxystate", &service, "off"])?;
+                changed += 1;
+            }
+        }
+        Ok(changed)
+    }
+
+    fn count_matching_proxies(
+        &self,
+        target_port: u16,
+        preserve_service: Option<&str>,
+    ) -> Result<usize, String> {
+        let mut matches = 0;
+        for service in network_services()? {
+            if preserve_service
+                .map(|preserved| service_names_match(preserved, &service))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            if setting_matches(&get_proxy_setting(&service, "-getwebproxy")?, target_port) {
+                matches += 1;
+            }
+            if setting_matches(
+                &get_proxy_setting(&service, "-getsecurewebproxy")?,
+                target_port,
+            ) {
+                matches += 1;
+            }
+            if setting_matches(
+                &get_proxy_setting(&service, "-getsocksfirewallproxy")?,
+                target_port,
+            ) {
+                matches += 1;
+            }
+            if auto_proxy_matches(&get_auto_proxy_setting(&service)?, target_port) {
+                matches += 1;
+            }
+        }
+        Ok(matches)
+    }
 }
 
 fn empty_setting() -> SystemProxySetting {
@@ -255,10 +440,62 @@ fn empty_setting() -> SystemProxySetting {
     }
 }
 
+fn empty_url_setting() -> SystemProxyUrlSetting {
+    SystemProxyUrlSetting {
+        enabled: false,
+        url: String::new(),
+    }
+}
+
 fn setting_matches(setting: &SystemProxySetting, target_port: u16) -> bool {
     setting.enabled
         && setting.host.trim().eq_ignore_ascii_case(TARGET_HOST)
         && setting.port == Some(target_port)
+}
+
+fn auto_proxy_matches(setting: &SystemProxyUrlSetting, target_port: u16) -> bool {
+    if !setting.enabled {
+        return false;
+    }
+    let Ok(url) = Url::parse(&setting.url) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or_default();
+    (host.eq_ignore_ascii_case(TARGET_HOST) || host.eq_ignore_ascii_case("localhost"))
+        && url.port_or_known_default() == Some(target_port)
+        && url.path() == "/proxy.pac"
+}
+
+fn service_names_match(left: &str, right: &str) -> bool {
+    left.trim().eq_ignore_ascii_case(right.trim())
+}
+
+fn desktop_pac_url(target_port: u16, capture_hosts: &[String]) -> String {
+    format!(
+        "http://{TARGET_HOST}:{target_port}/proxy.pac?v={}",
+        capture_hosts_fingerprint(capture_hosts)
+    )
+}
+
+fn capture_hosts_fingerprint(capture_hosts: &[String]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    if capture_hosts.is_empty() {
+        return "all".to_string();
+    }
+    for host in capture_hosts {
+        for byte in host.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn local_proxy_reachable(target_port: u16) -> bool {
+    let address = SocketAddr::from(([127, 0, 0, 1], target_port));
+    TcpStream::connect_timeout(&address, Duration::from_millis(120)).is_ok()
 }
 
 fn preferred_network_service() -> Result<String, String> {
@@ -289,6 +526,14 @@ fn get_proxy_setting(service: &str, command: &str) -> Result<SystemProxySetting,
     parse_proxy_setting(&run_networksetup(&[command, service])?)
 }
 
+fn get_auto_proxy_setting(service: &str) -> Result<SystemProxyUrlSetting, String> {
+    parse_auto_proxy_setting(&run_networksetup(&["-getautoproxyurl", service])?)
+}
+
+fn get_auto_discovery_enabled(service: &str) -> Result<bool, String> {
+    parse_auto_discovery_enabled(&run_networksetup(&["-getproxyautodiscovery", service])?)
+}
+
 fn parse_proxy_setting(output: &str) -> Result<SystemProxySetting, String> {
     let mut enabled = false;
     let mut host = String::new();
@@ -317,6 +562,48 @@ fn parse_proxy_setting(output: &str) -> Result<SystemProxySetting, String> {
         host,
         port,
     })
+}
+
+fn parse_auto_proxy_setting(output: &str) -> Result<SystemProxyUrlSetting, String> {
+    let mut enabled = false;
+    let mut url = String::new();
+
+    for line in output.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim().to_ascii_lowercase().as_str() {
+            "enabled" => {
+                enabled = matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "yes" | "on" | "1" | "true"
+                );
+            }
+            "url" => {
+                url = if value == "(null)" {
+                    String::new()
+                } else {
+                    value.to_string()
+                };
+            }
+            _ => {}
+        }
+    }
+
+    Ok(SystemProxyUrlSetting { enabled, url })
+}
+
+fn parse_auto_discovery_enabled(output: &str) -> Result<bool, String> {
+    Ok(output
+        .lines()
+        .filter_map(|line| line.split_once(':').map(|(_, value)| value.trim()))
+        .any(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "yes" | "on" | "1" | "true"
+            )
+        }))
 }
 
 fn restore_web_proxy(
@@ -364,8 +651,9 @@ if ($null -ne $item.ProxyOverride) {{ $proxyOverride = [string]$item.ProxyOverri
 
 fn set_windows_proxy(target_port: u16) -> Result<(), String> {
     let key = powershell_string(WINDOWS_INTERNET_SETTINGS_KEY);
-    let proxy_server =
-        powershell_string(&format!("http={TARGET_HOST}:{target_port};https={TARGET_HOST}:{target_port}"));
+    let proxy_server = powershell_string(&format!(
+        "http={TARGET_HOST}:{target_port};https={TARGET_HOST}:{target_port}"
+    ));
     let script = format!(
         r#"
 $ErrorActionPreference = 'Stop'
@@ -552,6 +840,18 @@ fn powershell_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+fn restore_auto_proxy(service: &str, setting: &SystemProxyUrlSetting) -> Result<(), String> {
+    if !setting.url.trim().is_empty() {
+        run_networksetup(&["-setautoproxyurl", service, &setting.url])?;
+    }
+    run_networksetup(&[
+        "-setautoproxystate",
+        service,
+        if setting.enabled { "on" } else { "off" },
+    ])?;
+    Ok(())
+}
+
 fn run_networksetup(args: &[&str]) -> Result<String, String> {
     let output = Command::new("networksetup")
         .args(args)
@@ -572,7 +872,10 @@ fn run_networksetup(args: &[&str]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_proxy_setting, parse_windows_proxy_settings};
+    use super::{
+        auto_proxy_matches, parse_auto_discovery_enabled, parse_auto_proxy_setting,
+        parse_proxy_setting, parse_windows_proxy_settings,
+    };
 
     #[test]
     fn parses_enabled_networksetup_proxy_output() {
@@ -636,5 +939,23 @@ mod tests {
         assert!(!https.enabled);
         assert_eq!(http.host, "127.0.0.1");
         assert_eq!(https.port, Some(9090));
+    }
+
+    #[test]
+    fn parses_auto_proxy_output() {
+        let setting =
+            parse_auto_proxy_setting("URL: http://127.0.0.1:9090/proxy.pac?v=abc\nEnabled: Yes\n")
+                .expect("parse auto proxy setting");
+
+        assert!(setting.enabled);
+        assert_eq!(setting.url, "http://127.0.0.1:9090/proxy.pac?v=abc");
+        assert!(auto_proxy_matches(&setting, 9090));
+        assert!(!auto_proxy_matches(&setting, 9091));
+    }
+
+    #[test]
+    fn parses_auto_discovery_output() {
+        assert!(parse_auto_discovery_enabled("Auto Proxy Discovery: On\n").expect("parse on"));
+        assert!(!parse_auto_discovery_enabled("Auto Proxy Discovery: Off\n").expect("parse off"));
     }
 }

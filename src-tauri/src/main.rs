@@ -24,7 +24,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use system_proxy::SystemProxyManager;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 struct AppState {
     config: Mutex<AppConfig>,
@@ -264,12 +264,12 @@ fn restore_system_proxy_on_exit(app_handle: &tauri::AppHandle) {
     };
     let config = state.config.lock().expect("config mutex poisoned").clone();
 
-    let target_port = state
-        .proxy
-        .lock()
-        .expect("proxy mutex poisoned")
-        .status(&config)
-        .port;
+    let target_port = {
+        let mut proxy = state.proxy.lock().expect("proxy mutex poisoned");
+        let port = proxy.status(&config).port;
+        let _ = proxy.stop();
+        port
+    };
 
     let _ = state
         .system_proxy
@@ -499,17 +499,16 @@ fn system_proxy_status(state: tauri::State<AppState>) -> Result<models::SystemPr
 #[tauri::command]
 fn system_proxy_apply(state: tauri::State<AppState>) -> Result<models::SystemProxyStatus, String> {
     let config = config_snapshot(&state);
-    let target_port = state
+    let proxy_status = state
         .proxy
         .lock()
         .expect("proxy mutex poisoned")
-        .status(&config)
-        .port;
+        .status(&config);
     state
         .system_proxy
         .lock()
         .expect("system proxy mutex poisoned")
-        .apply(target_port)
+        .apply(proxy_status.port, &proxy_status.capture_hosts)
 }
 
 #[tauri::command]
@@ -647,16 +646,48 @@ async fn ai_ask_agent(
         .await
 }
 
+#[tauri::command]
+async fn ai_ask_agent_stream(
+    stream_id: String,
+    question: String,
+    flows: Option<Vec<CaptureFlow>>,
+    history: Option<Vec<AgentChatMessage>>,
+    attachments: Option<Vec<AgentAttachment>>,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<models::AiResult, String> {
+    AiService::new(&config_snapshot(&state))?
+        .ask_agent_stream(
+            stream_id,
+            question,
+            flows.unwrap_or_else(|| {
+                state
+                    .proxy
+                    .lock()
+                    .expect("proxy mutex poisoned")
+                    .list_flows()
+            }),
+            history.unwrap_or_default(),
+            attachments.unwrap_or_default(),
+            move |event| {
+                let _ = app.emit("agent-answer-stream", event);
+            },
+        )
+        .await
+}
+
 fn main() {
     ensure_rustls_crypto_provider();
     let config = load_config();
+    let system_proxy = SystemProxyManager::new(system_proxy_snapshot_path());
+    let _ = system_proxy.cleanup_stale(config.proxy_port);
     let proxy = ProxyService::new(&config);
 
     let app = tauri::Builder::default()
         .manage(AppState {
             config: Mutex::new(config),
             proxy: Mutex::new(proxy),
-            system_proxy: Mutex::new(SystemProxyManager::new(system_proxy_snapshot_path())),
+            system_proxy: Mutex::new(system_proxy),
         })
         .invoke_handler(tauri::generate_handler![
             get_config,
@@ -690,6 +721,7 @@ fn main() {
             ai_compare_flows,
             ai_generate_bug_report,
             ai_ask_agent,
+            ai_ask_agent_stream,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build tauri application");

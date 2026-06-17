@@ -82,6 +82,13 @@ pub struct SystemProxySetting {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SystemProxyUrlSetting {
+    pub enabled: bool,
+    pub url: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SystemProxyStatus {
     pub supported: bool,
     pub service: Option<String>,
@@ -90,6 +97,8 @@ pub struct SystemProxyStatus {
     pub http: SystemProxySetting,
     pub https: SystemProxySetting,
     pub socks: SystemProxySetting,
+    pub auto_proxy: SystemProxyUrlSetting,
+    pub auto_discovery_enabled: bool,
     pub matches_proxy: bool,
     pub managed_proxy_active: bool,
     pub can_restore: bool,

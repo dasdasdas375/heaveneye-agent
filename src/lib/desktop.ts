@@ -69,6 +69,13 @@ export type DesktopBackend = {
       history?: AgentChatMessage[];
       attachments?: AgentAttachment[];
     }) => Promise<AiResult>;
+    askAgentStream: (payload: {
+      streamId: string;
+      question: string;
+      flows?: CaptureFlow[];
+      history?: AgentChatMessage[];
+      attachments?: AgentAttachment[];
+    }) => Promise<AiResult>;
   };
 };
 
@@ -143,6 +150,7 @@ function createTauriBackend(invoke: TauriInvoke): DesktopBackend {
       compareFlows: (payload) => invokeProxy<AiResult>(invoke, "ai_compare_flows", payload),
       generateBugReport: (payload) => invokeProxy<AiResult>(invoke, "ai_generate_bug_report", payload),
       askAgent: (payload) => invokeProxy<AiResult>(invoke, "ai_ask_agent", payload),
+      askAgentStream: (payload) => invokeProxy<AiResult>(invoke, "ai_ask_agent_stream", payload),
     },
   };
 }
@@ -472,6 +480,8 @@ function createWebDemoBackend(): DesktopBackend {
         http: { enabled: false, host: "", port: null },
         https: { enabled: false, host: "", port: null },
         socks: { enabled: false, host: "", port: null },
+        autoProxy: { enabled: false, url: "" },
+        autoDiscoveryEnabled: false,
         matchesProxy: true,
         managedProxyActive: false,
         canRestore: false,
@@ -520,6 +530,12 @@ function createWebDemoBackend(): DesktopBackend {
         usage: null,
       }),
       askAgent: async ({ question }) => ({
+        model: "web-demo",
+        content: `Web demo 收到问题：${question}`,
+        structured: null,
+        usage: null,
+      }),
+      askAgentStream: async ({ question }) => ({
         model: "web-demo",
         content: `Web demo 收到问题：${question}`,
         structured: null,
@@ -617,6 +633,7 @@ export function createDesktopBackend(options: CreateDesktopBackendOptions = {}):
       compareFlows: async (payload) => (await resolveBackend()).ai.compareFlows(payload),
       generateBugReport: async (payload) => (await resolveBackend()).ai.generateBugReport(payload),
       askAgent: async (payload) => (await resolveBackend()).ai.askAgent(payload),
+      askAgentStream: async (payload) => (await resolveBackend()).ai.askAgentStream(payload),
     },
   };
 }
