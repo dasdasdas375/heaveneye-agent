@@ -1,7 +1,7 @@
 use crate::certs::CertificateService;
 use crate::models::{
-    AppConfig, BreakpointDecision, BreakpointRequest, CaptureBodyContent, CaptureFlow, ProxyRule,
-    ProxyStatus, SseEventCapture, WeakNetworkProfile,
+    AppConfig, BreakpointDecision, BreakpointRequest, CaptureBodyContent, CaptureFlow,
+    CaptureFlowSnapshot, ProxyRule, ProxyStatus, SseEventCapture, WeakNetworkProfile,
 };
 use bytes::Bytes;
 use flate2::read::{GzDecoder, ZlibDecoder};
@@ -16,6 +16,7 @@ use std::io::{BufReader, Cursor, ErrorKind, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::Path;
 use std::pin::Pin;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -26,6 +27,8 @@ use url::Url;
 use webpki_roots::TLS_SERVER_ROOTS;
 
 const BODY_PREVIEW_LIMIT: usize = 128 * 1024;
+const MAX_CAPTURE_DECODE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_ACTIVE_PROXY_CONNECTIONS: usize = 96;
 const DEFAULT_MITM_BYPASS_HOSTS: &[&str] = &[
     "apple-cloudkit.com",
     "google.com",
@@ -56,6 +59,49 @@ pub struct ProxyService {
 struct ProxyController {
     stop_tx: mpsc::Sender<()>,
     thread: JoinHandle<()>,
+}
+
+struct ConnectionLimiter {
+    active: Mutex<usize>,
+    max: usize,
+}
+
+struct ConnectionPermit {
+    limiter: Arc<ConnectionLimiter>,
+}
+
+impl ConnectionLimiter {
+    fn new(max: usize) -> Arc<Self> {
+        Arc::new(Self {
+            active: Mutex::new(0),
+            max,
+        })
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<ConnectionPermit> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *active >= self.max {
+            return None;
+        }
+        *active += 1;
+        Some(ConnectionPermit {
+            limiter: Arc::clone(self),
+        })
+    }
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        let mut active = self
+            .limiter
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *active = active.saturating_sub(1);
+    }
 }
 
 #[derive(Clone)]
@@ -378,6 +424,17 @@ impl ProxyService {
             .expect("capture hosts mutex poisoned") = normalize_capture_hosts(&[hosts.to_string()]);
     }
 
+    pub fn flow_snapshot(&self, known_revision: Option<&str>) -> CaptureFlowSnapshot {
+        let flows = self.flows.lock().expect("flows mutex poisoned");
+        let revision = flow_revision(&flows);
+        let changed = known_revision != Some(revision.as_str());
+        CaptureFlowSnapshot {
+            revision,
+            changed,
+            flows: if changed { flows.clone() } else { Vec::new() },
+        }
+    }
+
     pub fn list_flows(&self) -> Vec<CaptureFlow> {
         self.flows.lock().expect("flows mutex poisoned").clone()
     }
@@ -539,6 +596,7 @@ fn run_proxy_loop(
     config: AppConfig,
     proxy_port: u16,
 ) {
+    let connection_limiter = ConnectionLimiter::new(MAX_ACTIVE_PROXY_CONNECTIONS);
     loop {
         match stop_rx.try_recv() {
             Ok(_) | Err(mpsc::TryRecvError::Disconnected) => break,
@@ -547,6 +605,17 @@ fn run_proxy_loop(
 
         match listener.accept() {
             Ok((stream, _addr)) => {
+                let permit = loop {
+                    if let Some(permit) = connection_limiter.try_acquire() {
+                        break permit;
+                    }
+                    match stop_rx.try_recv() {
+                        Ok(_) | Err(mpsc::TryRecvError::Disconnected) => return,
+                        Err(mpsc::TryRecvError::Empty) => {
+                            thread::sleep(Duration::from_millis(25));
+                        }
+                    }
+                };
                 let flows = Arc::clone(&flows);
                 let capture_hosts = Arc::clone(&capture_hosts);
                 let rules = Arc::clone(&rules);
@@ -554,6 +623,7 @@ fn run_proxy_loop(
                 let breakpoints = breakpoints.clone();
                 let config = config.clone();
                 thread::spawn(move || {
+                    let _permit = permit;
                     if let Err(error) = handle_client(
                         stream,
                         flows,
@@ -590,7 +660,17 @@ fn handle_client(
     let client_addr = client_stream.peer_addr().ok();
 
     let request = read_http_request(&mut client_stream)?;
-    if try_serve_mobile_setup(&request, &mut client_stream, &config, proxy_port)? {
+    let capture_hosts_snapshot = capture_hosts
+        .lock()
+        .expect("capture hosts mutex poisoned")
+        .clone();
+    if try_serve_mobile_setup(
+        &request,
+        &mut client_stream,
+        &config,
+        proxy_port,
+        &capture_hosts_snapshot,
+    )? {
         return Ok(());
     }
     if request.method.eq_ignore_ascii_case("CONNECT") {
@@ -637,6 +717,7 @@ fn try_serve_mobile_setup(
     client_stream: &mut TcpStream,
     config: &AppConfig,
     proxy_port: u16,
+    capture_hosts: &[String],
 ) -> Result<bool, String> {
     let Some(path) = mobile_control_path(request, proxy_port) else {
         return Ok(false);
@@ -659,7 +740,7 @@ fn try_serve_mobile_setup(
             proxy_pac_script(
                 &proxy_host_for_pac(request, &lan_ip, proxy_port),
                 proxy_port,
-                &config.capture_hosts,
+                capture_hosts,
             )
             .into_bytes(),
         ),
@@ -821,7 +902,7 @@ fn proxy_pac_script(proxy_host: &str, proxy_port: u16, capture_hosts: &[String])
   }}
   var patterns = [{exact_patterns}];
   if (patterns.length === 0) {{
-    return proxy;
+    return "DIRECT";
   }}
   for (var i = 0; i < patterns.length; i++) {{
     if (matchesCaptureHost(host, patterns[i])) {{
@@ -1103,6 +1184,7 @@ fn macos_default_interface() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+#[cfg(target_os = "macos")]
 fn is_private_lan_ip(value: &str) -> bool {
     let Ok(IpAddr::V4(ip)) = value.parse::<IpAddr>() else {
         return false;
@@ -1113,6 +1195,7 @@ fn is_private_lan_ip(value: &str) -> bool {
         || (octets[0] == 192 && octets[1] == 168)
 }
 
+#[cfg(target_os = "macos")]
 fn is_usable_ip_text(value: &str) -> bool {
     match value.parse::<IpAddr>() {
         Ok(IpAddr::V4(ip)) => is_usable_ipv4(ip.octets()),
@@ -1261,13 +1344,9 @@ fn handle_connect(
                 let _ = std::io::copy(&mut upstream_reader, &mut client_writer);
                 let _ = client_writer.shutdown(Shutdown::Write);
             });
-            let client_to_upstream = thread::spawn(move || {
-                let _ = std::io::copy(&mut client_reader, &mut upstream_writer);
-                let _ = upstream_writer.shutdown(Shutdown::Write);
-            });
-
+            let _ = std::io::copy(&mut client_reader, &mut upstream_writer);
+            let _ = upstream_writer.shutdown(Shutdown::Write);
             let _ = upstream_to_client.join();
-            let _ = client_to_upstream.join();
 
             if should_capture {
                 push_flow(
@@ -1497,6 +1576,7 @@ fn handle_forward_http(
             Ok(intercepted.response_bytes)
         }
         RequestControlOutcome::Forward(forward) => {
+            let forward = prepare_forward_for_upstream(forward, &rules);
             base_tags.extend(forward.tags);
             apply_weak_network_before_upstream(&weak_network);
             forward_http_request(&forward.request, &forward.target_url)
@@ -1909,12 +1989,17 @@ fn handle_tls_mitm_connection(
                 intercepted.response_bytes
             }
             RequestControlOutcome::Forward(forward) => {
+                let forward = prepare_forward_for_upstream(forward, &rules);
                 flow_tags.extend(forward.tags);
                 apply_weak_network_before_upstream(&weak_network);
                 let upstream_response = open_https_response(&forward.request, &forward.target_url)?;
-                if is_event_stream_response(&upstream_response.parsed.headers) {
-                    flow_tags.push("streaming-response".into());
-                    flow_tags.push("sse".into());
+                let is_event_stream = is_event_stream_response(&upstream_response.parsed.headers);
+                if !response_controls_require_buffering(&forward.target_url, &rules) {
+                    flow_tags.push("streamed-response".into());
+                    if is_event_stream {
+                        flow_tags.push("streaming-response".into());
+                        flow_tags.push("sse".into());
+                    }
                     flow_tags.push("ssl-decrypted".into());
                     let response_headers = upstream_response.parsed.headers.clone();
                     let status_code = upstream_response.parsed.status_code;
@@ -1923,7 +2008,8 @@ fn handle_tls_mitm_connection(
                         &host,
                         &capture_hosts.lock().expect("capture hosts mutex poisoned"),
                     ) {
-                        let open_preview = streaming_response_open_preview(&response_headers);
+                        let open_preview =
+                            passthrough_response_open_preview(&response_headers, is_event_stream);
                         push_flow(
                             &flows,
                             CaptureFlow {
@@ -1968,9 +2054,20 @@ fn handle_tls_mitm_connection(
                     let live_update_headers = response_headers.clone();
                     let live_update_flows = flows.clone();
                     let live_update_flow_id = flow_id_for_update.clone();
+                    let downstream_kbps = {
+                        let profile = weak_network.lock().expect("weak network mutex poisoned");
+                        if profile.enabled {
+                            profile.downstream_kbps
+                        } else {
+                            0
+                        }
+                    };
                     match relay_https_streaming_response(
                         upstream_response,
                         &mut tls_stream,
+                        is_event_stream,
+                        request.method.eq_ignore_ascii_case("HEAD"),
+                        downstream_kbps,
                         |preview_bytes, response_size| {
                             let response_preview = streaming_preview_from_bytes(
                                 preview_bytes,
@@ -2217,6 +2314,7 @@ fn handle_h2_mitm_connection(
                     Ok(intercepted.response_bytes)
                 }
                 RequestControlOutcome::Forward(forward) => {
+                    let forward = prepare_forward_for_upstream(forward, &rules);
                     base_tags.extend(forward.tags);
                     apply_weak_network_before_upstream(&weak_network);
                     if forward.request.version == "HTTP/2" {
@@ -2485,12 +2583,29 @@ fn read_https_response_to_end(mut response: OpenHttpsResponse) -> Result<Vec<u8>
 fn relay_https_streaming_response<F>(
     mut response: OpenHttpsResponse,
     client_stream: &mut StreamOwned<ServerConnection, TcpStream>,
+    allow_idle: bool,
+    request_has_no_response_body: bool,
+    downstream_kbps: u64,
     mut on_progress: F,
 ) -> Result<(Vec<u8>, u64), String>
 where
     F: FnMut(&[u8], u64),
 {
-    let _ = response.stream.sock.set_read_timeout(None);
+    if allow_idle {
+        let _ = response.stream.sock.set_read_timeout(None);
+    }
+    let expected_body_size = if request_has_no_response_body
+        || (100..200).contains(&response.parsed.status_code)
+        || matches!(response.parsed.status_code, 204 | 304)
+    {
+        Some(0)
+    } else {
+        response
+            .parsed
+            .headers
+            .get("content-length")
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    };
     client_stream
         .write_all(&response.head)
         .map_err(|error| error.to_string())?;
@@ -2510,9 +2625,13 @@ where
             response_size,
             &mut last_progress_at,
         );
+        throttle_streaming_chunk(downstream_kbps, response.remainder.len());
         if !write_streaming_bytes(client_stream, &response.remainder)? {
             return Ok((preview_bytes, response_size));
         }
+    }
+    if expected_body_size.is_some_and(|expected| response_size >= expected) {
+        return Ok((preview_bytes, response_size));
     }
 
     loop {
@@ -2529,7 +2648,11 @@ where
                     response_size,
                     &mut last_progress_at,
                 );
+                throttle_streaming_chunk(downstream_kbps, read);
                 if !write_streaming_bytes(client_stream, bytes)? {
+                    break;
+                }
+                if expected_body_size.is_some_and(|expected| response_size >= expected) {
                     break;
                 }
             }
@@ -2539,6 +2662,20 @@ where
     }
 
     Ok((preview_bytes, response_size))
+}
+
+fn throttle_streaming_chunk(downstream_kbps: u64, bytes: usize) {
+    if downstream_kbps == 0 || bytes == 0 {
+        return;
+    }
+    let delay_ms = (bytes as u64)
+        .saturating_mul(1000)
+        .checked_div(downstream_kbps.saturating_mul(1024).max(1))
+        .unwrap_or(0)
+        .min(30_000);
+    if delay_ms > 0 {
+        thread::sleep(Duration::from_millis(delay_ms));
+    }
 }
 
 fn emit_streaming_progress<F>(
@@ -2594,15 +2731,23 @@ fn is_event_stream_response(headers: &HashMap<String, String>) -> bool {
         .contains("text/event-stream")
 }
 
-fn streaming_response_open_preview(headers: &HashMap<String, String>) -> BufferPreview {
+fn passthrough_response_open_preview(
+    headers: &HashMap<String, String>,
+    is_event_stream: bool,
+) -> BufferPreview {
     let content_type = header_value(headers, "content-type");
     let preview = format!(
-        "[streaming response open]\ncontent-type: {}\nHeavenEye is forwarding this EventStream response without waiting for it to close.",
+        "[streaming response open]\ncontent-type: {}\n{}",
         if content_type.is_empty() {
-            "text/event-stream"
+            "application/octet-stream"
         } else {
             content_type.as_str()
-        }
+        },
+        if is_event_stream {
+            "HeavenEye is forwarding this EventStream response without waiting for it to close."
+        } else {
+            "HeavenEye is forwarding this response without buffering the full body in memory."
+        },
     );
     BufferPreview {
         size: 0,
@@ -2627,15 +2772,26 @@ fn streaming_preview_from_bytes(
     } else {
         preview_bytes.to_vec()
     };
+    let decoded = decode_body_buffer(
+        &display_bytes,
+        headers,
+        headers
+            .get("content-encoding")
+            .map(String::as_str)
+            .unwrap_or_default(),
+    );
     let preview = if preview_bytes.is_empty() {
         "[streaming response completed without captured body bytes]".to_string()
+    } else if is_binary_preview(headers, &decoded) {
+        binary_preview_message(headers, decoded.len())
     } else {
-        String::from_utf8_lossy(&display_bytes).to_string()
+        String::from_utf8_lossy(&decoded[..decoded.len().min(BODY_PREVIEW_LIMIT)]).to_string()
     };
-    let preview_truncated = response_size > preview_bytes.len() as u64;
+    let preview_truncated =
+        response_size > preview_bytes.len() as u64 || decoded.len() > BODY_PREVIEW_LIMIT;
     BufferPreview {
         size: response_size.min(usize::MAX as u64) as usize,
-        decoded_size: preview.len(),
+        decoded_size: decoded.len(),
         text_body_path: None,
         preview,
         preview_truncated,
@@ -3159,6 +3315,29 @@ fn matching_rule_for_phase(
     matching_rules_for_phase(target_url, rules, phase, kinds)
         .into_iter()
         .next()
+}
+
+fn prepare_forward_for_upstream(
+    mut forward: RequestControlForward,
+    rules: &Arc<Mutex<Vec<ProxyRule>>>,
+) -> RequestControlForward {
+    let requires_uncompressed_response =
+        response_controls_require_buffering(&forward.target_url, rules);
+    if requires_uncompressed_response {
+        forward
+            .request
+            .headers
+            .insert("accept-encoding".into(), "identity".into());
+    }
+    forward
+}
+
+fn response_controls_require_buffering(
+    target_url: &Url,
+    rules: &Arc<Mutex<Vec<ProxyRule>>>,
+) -> bool {
+    let rules = rules.lock().expect("rules mutex poisoned");
+    !matching_rules_for_phase(target_url, &rules, "response", &["rewrite", "breakpoint"]).is_empty()
 }
 
 fn matching_rules_for_phase(
@@ -4133,7 +4312,12 @@ fn append_upstream_request_headers(wire: &mut String, request: &ParsedRequest, a
     if !has_content_length && request.headers.contains_key("content-length") {
         wire.push_str("Content-Length: 0\r\n");
     }
-    wire.push_str("Accept-Encoding: identity\r\n");
+    let accept_encoding = header_value(&request.headers, "accept-encoding");
+    wire.push_str(if accept_encoding.eq_ignore_ascii_case("identity") {
+        "Accept-Encoding: identity\r\n"
+    } else {
+        "Accept-Encoding: gzip, deflate\r\n"
+    });
     wire.push_str("Connection: close\r\n\r\n");
 }
 
@@ -4290,6 +4474,8 @@ fn buffer_preview(
         body.to_vec()
     };
     let decoded = decode_body_buffer(&preview_body, headers, &encoding_override);
+    let decode_limit_reached = decoded.len() > MAX_CAPTURE_DECODE_BYTES;
+    let decoded = &decoded[..decoded.len().min(MAX_CAPTURE_DECODE_BYTES)];
     if is_binary_preview(headers, &decoded) {
         return BufferPreview {
             size: body.len(),
@@ -4304,8 +4490,12 @@ fn buffer_preview(
         decoded_size: decoded.len(),
         preview: String::from_utf8_lossy(&decoded[..decoded.len().min(BODY_PREVIEW_LIMIT)])
             .to_string(),
-        preview_truncated: decoded.len() > BODY_PREVIEW_LIMIT,
-        text_body_path: store_text_body(&decoded),
+        preview_truncated: decode_limit_reached || decoded.len() > BODY_PREVIEW_LIMIT,
+        text_body_path: if decode_limit_reached {
+            None
+        } else {
+            store_text_body(decoded)
+        },
     }
 }
 
@@ -4403,27 +4593,37 @@ fn decode_body_buffer(
             .to_ascii_lowercase()
     };
 
-    if encoding.is_empty() || body.is_empty() {
-        return body.to_vec();
+    if body.is_empty() {
+        return Vec::new();
+    }
+
+    if encoding.is_empty() {
+        return body[..body.len().min(MAX_CAPTURE_DECODE_BYTES + 1)].to_vec();
     }
 
     if encoding.contains("gzip") {
-        let mut decoder = GzDecoder::new(Cursor::new(body));
+        let decoder = GzDecoder::new(Cursor::new(body));
         let mut decoded = Vec::new();
-        if decoder.read_to_end(&mut decoded).is_ok() {
+        let result = decoder
+            .take((MAX_CAPTURE_DECODE_BYTES + 1) as u64)
+            .read_to_end(&mut decoded);
+        if result.is_ok() || !decoded.is_empty() {
             return decoded;
         }
     }
 
     if encoding.contains("deflate") {
-        let mut decoder = ZlibDecoder::new(Cursor::new(body));
+        let decoder = ZlibDecoder::new(Cursor::new(body));
         let mut decoded = Vec::new();
-        if decoder.read_to_end(&mut decoded).is_ok() {
+        let result = decoder
+            .take((MAX_CAPTURE_DECODE_BYTES + 1) as u64)
+            .read_to_end(&mut decoded);
+        if result.is_ok() || !decoded.is_empty() {
             return decoded;
         }
     }
 
-    body.to_vec()
+    body[..body.len().min(MAX_CAPTURE_DECODE_BYTES + 1)].to_vec()
 }
 
 fn request_body_encoding_from_url(target_url: &Url) -> String {
@@ -4446,6 +4646,28 @@ fn request_wants_close(request: &ParsedRequest) -> bool {
         .get("connection")
         .map(|value| value.to_ascii_lowercase().contains("close"))
         .unwrap_or(false)
+}
+
+fn flow_revision(flows: &[CaptureFlow]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for flow in flows {
+        for byte in flow.id.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        for value in [
+            flow.completed_at.unwrap_or_default(),
+            flow.duration_ms.unwrap_or_default(),
+            flow.response_size,
+            u64::from(flow.status_code.unwrap_or_default()),
+        ] {
+            hash ^= value;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= flow.sse_events.len() as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{}-{hash:016x}", flows.len())
 }
 
 fn push_flow(flows: &Arc<Mutex<Vec<CaptureFlow>>>, flow: CaptureFlow) {
@@ -4472,7 +4694,11 @@ fn update_streaming_flow(
     if let Some(flow) = flows.iter_mut().find(|flow| flow.id == flow_id) {
         let storage_tags = body_storage_tags(&response_preview, "response");
         let now = now_millis();
-        let sse_events = merge_sse_event_captures(&flow.sse_events, &response_preview.preview, now);
+        let sse_events = if flow.tags.iter().any(|tag| tag == "sse") {
+            merge_sse_event_captures(&flow.sse_events, &response_preview.preview, now)
+        } else {
+            Vec::new()
+        };
         if completed {
             flow.completed_at = Some(now);
         }
@@ -4751,12 +4977,12 @@ fn registrable_domain(host: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        buffer_preview, configure_client_stream, decode_chunked_partial, host_matches_pattern,
-        is_event_stream_response, is_websocket_upgrade, matching_rule_for_phase,
-        merge_sse_event_captures, mitm_alpn_protocols, normalize_capture_hosts,
-        parse_sse_events_for_capture, poll_blocking_result, proxy_pac_script,
-        rewrite_response_for_rule, should_capture_host, should_mitm_host,
-        streaming_preview_from_bytes, websocket_request_wire, ParsedRequest,
+        append_upstream_request_headers, buffer_preview, configure_client_stream,
+        decode_chunked_partial, host_matches_pattern, is_event_stream_response,
+        is_websocket_upgrade, matching_rule_for_phase, merge_sse_event_captures,
+        mitm_alpn_protocols, normalize_capture_hosts, parse_sse_events_for_capture,
+        poll_blocking_result, proxy_pac_script, rewrite_response_for_rule, should_capture_host,
+        should_mitm_host, streaming_preview_from_bytes, websocket_request_wire, ParsedRequest,
     };
     use crate::models::ProxyRule;
     use std::collections::HashMap;
@@ -4800,6 +5026,14 @@ mod tests {
         assert!(script.contains("PROXY 127.0.0.1:9090; DIRECT"));
         assert!(script.contains("\"app.example.test\""));
         assert!(script.contains("\"example.test\""));
+        assert!(script.contains("return \"DIRECT\""));
+    }
+
+    #[test]
+    fn pac_script_without_targets_does_not_capture_the_whole_machine() {
+        let script = proxy_pac_script("127.0.0.1", 9090, &[]);
+
+        assert!(script.contains("if (patterns.length === 0)"));
         assert!(script.contains("return \"DIRECT\""));
     }
 
@@ -4927,6 +5161,43 @@ mod tests {
         assert!(wire.contains("upgrade: websocket\r\n"));
         assert!(wire.contains("sec-websocket-key: abc\r\n"));
         assert!(wire.contains("Host: socket.example.test\r\n"));
+    }
+
+    #[test]
+    fn upstream_requests_keep_compression_enabled_by_default() {
+        let request = ParsedRequest {
+            method: "GET".into(),
+            target: "https://api.example.test/data".into(),
+            version: "HTTP/1.1".into(),
+            headers: HashMap::from([
+                ("host".into(), "api.example.test".into()),
+                ("accept-encoding".into(), "gzip, deflate, br, zstd".into()),
+            ]),
+            body: Vec::new(),
+        };
+        let mut wire = "GET /data HTTP/1.1\r\n".to_string();
+
+        append_upstream_request_headers(&mut wire, &request, "api.example.test");
+
+        assert!(wire.contains("Accept-Encoding: gzip, deflate\r\n"));
+        assert!(!wire.contains("Accept-Encoding: identity"));
+        assert!(!wire.contains("zstd"));
+    }
+
+    #[test]
+    fn upstream_requests_allow_identity_for_response_editing() {
+        let request = ParsedRequest {
+            method: "GET".into(),
+            target: "https://api.example.test/data".into(),
+            version: "HTTP/1.1".into(),
+            headers: HashMap::from([("accept-encoding".into(), "identity".into())]),
+            body: Vec::new(),
+        };
+        let mut wire = "GET /data HTTP/1.1\r\n".to_string();
+
+        append_upstream_request_headers(&mut wire, &request, "api.example.test");
+
+        assert!(wire.contains("Accept-Encoding: identity\r\n"));
     }
 
     #[test]

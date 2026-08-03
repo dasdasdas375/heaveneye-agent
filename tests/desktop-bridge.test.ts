@@ -68,4 +68,21 @@ describe("desktop bridge", () => {
 
     await expect(backend.getConfig()).rejects.toThrow(/desktop backend/i);
   });
+
+  it("passes the known flow revision to avoid unchanged full snapshots", async () => {
+    let receivedArgs: Record<string, unknown> | undefined;
+    const backend = createDesktopBackend({
+      loadTauriInvoke: async () => async (command: string, args?: Record<string, unknown>) => {
+        expect(command).toBe("proxy_flows");
+        receivedArgs = args;
+        return { revision: "12-abcd", changed: false, flows: [] };
+      },
+    });
+
+    await expect(backend.proxy.flows({ knownRevision: "12-abcd" })).resolves.toMatchObject({
+      changed: false,
+      flows: [],
+    });
+    expect(receivedArgs).toEqual({ knownRevision: "12-abcd" });
+  });
 });

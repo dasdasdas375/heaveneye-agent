@@ -8,6 +8,7 @@ import type {
   BreakpointRequest,
   CaptureBodyContent,
   CaptureFlow,
+  CaptureFlowSnapshot,
   CertInfo,
   ProxyRule,
   ProxyStatus,
@@ -28,7 +29,7 @@ export type DesktopBackend = {
     stop: () => Promise<ProxyStatus>;
     status: () => Promise<ProxyStatus>;
     setCaptureHosts: (payload: { hosts: string }) => Promise<ProxyStatus>;
-    flows: () => Promise<CaptureFlow[]>;
+    flows: (payload?: { knownRevision?: string | null }) => Promise<CaptureFlowSnapshot>;
     body: (payload: { flowId: string; direction: "request" | "response" }) => Promise<CaptureBodyContent>;
     clear: () => Promise<CaptureFlow[]>;
     replay: (payload: { flow: CaptureFlow }) => Promise<ReplayResult>;
@@ -113,7 +114,7 @@ function createTauriBackend(invoke: TauriInvoke): DesktopBackend {
       stop: () => invokeProxy<ProxyStatus>(invoke, "proxy_stop"),
       status: () => invokeProxy<ProxyStatus>(invoke, "proxy_status"),
       setCaptureHosts: (payload) => invokeProxy<ProxyStatus>(invoke, "proxy_set_capture_hosts", payload),
-      flows: () => invokeProxy<CaptureFlow[]>(invoke, "proxy_flows"),
+      flows: (payload) => invokeProxy<CaptureFlowSnapshot>(invoke, "proxy_flows", payload),
       body: (payload) => invokeProxy<CaptureBodyContent>(invoke, "proxy_body", payload),
       clear: () => invokeProxy<CaptureFlow[]>(invoke, "proxy_clear"),
       replay: (payload) => invokeProxy<ReplayResult>(invoke, "proxy_replay_flow", payload),
@@ -298,6 +299,7 @@ function demoFlows(): CaptureFlow[] {
 
 function createWebDemoBackend(): DesktopBackend {
   let flows = demoFlows();
+  let flowRevision = 1;
   let captureHosts = ["app.example.test"];
   let running = true;
   let rules: ProxyRule[] = [];
@@ -365,7 +367,11 @@ function createWebDemoBackend(): DesktopBackend {
           .filter(Boolean);
         return status();
       },
-      flows: async () => flows,
+      flows: async (payload) => {
+        const revision = String(flowRevision);
+        const changed = payload?.knownRevision !== revision;
+        return { revision, changed, flows: changed ? flows : [] };
+      },
       body: async ({ flowId, direction }) => {
         const flow = flows.find((item) => item.id === flowId);
         const content =
@@ -387,6 +393,7 @@ function createWebDemoBackend(): DesktopBackend {
       },
       clear: async () => {
         flows = [];
+        flowRevision += 1;
         return flows;
       },
       replay: async ({ flow }) => ({
@@ -423,6 +430,7 @@ function createWebDemoBackend(): DesktopBackend {
       }),
       importFlows: async (payload) => {
         flows = payload.flows;
+        flowRevision += 1;
         return flows;
       },
       rules: async () => rules,
@@ -602,7 +610,7 @@ export function createDesktopBackend(options: CreateDesktopBackendOptions = {}):
       stop: async () => (await resolveBackend()).proxy.stop(),
       status: async () => (await resolveBackend()).proxy.status(),
       setCaptureHosts: async (payload) => (await resolveBackend()).proxy.setCaptureHosts(payload),
-      flows: async () => (await resolveBackend()).proxy.flows(),
+      flows: async (payload) => (await resolveBackend()).proxy.flows(payload),
       body: async (payload) => (await resolveBackend()).proxy.body(payload),
       clear: async () => (await resolveBackend()).proxy.clear(),
       replay: async (payload) => (await resolveBackend()).proxy.replay(payload),

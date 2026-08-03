@@ -166,6 +166,14 @@ pub struct CaptureFlow {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CaptureFlowSnapshot {
+    pub revision: String,
+    pub changed: bool,
+    pub flows: Vec<CaptureFlow>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CaptureBodyContent {
     pub flow_id: String,
     pub direction: String,

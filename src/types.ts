@@ -117,6 +117,12 @@ export type CaptureFlow = {
   tags: string[];
 };
 
+export type CaptureFlowSnapshot = {
+  revision: string;
+  changed: boolean;
+  flows: CaptureFlow[];
+};
+
 export type ReplayResult = {
   startedAt: number;
   completedAt: number;

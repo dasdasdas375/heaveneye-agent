@@ -9,7 +9,8 @@ use ai::AiService;
 use certs::CertificateService;
 use models::{
     AgentAttachment, AgentChatMessage, AiConfigUpdate, AppConfig, BreakpointDecision,
-    CaptureBodyContent, CaptureFlow, ProxyRule, RequestDraft, WeakNetworkProfile,
+    CaptureBodyContent, CaptureFlow, CaptureFlowSnapshot, ProxyRule, RequestDraft,
+    WeakNetworkProfile,
 };
 use proxy::ProxyService;
 use replay::{replay_flow, send_request_draft};
@@ -330,12 +331,15 @@ fn proxy_set_capture_hosts(hosts: String, state: tauri::State<AppState>) -> mode
 }
 
 #[tauri::command]
-fn proxy_flows(state: tauri::State<AppState>) -> Vec<CaptureFlow> {
+fn proxy_flows(
+    known_revision: Option<String>,
+    state: tauri::State<AppState>,
+) -> CaptureFlowSnapshot {
     state
         .proxy
         .lock()
         .expect("proxy mutex poisoned")
-        .list_flows()
+        .flow_snapshot(known_revision.as_deref())
 }
 
 #[tauri::command]

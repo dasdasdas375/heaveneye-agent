@@ -10,6 +10,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_BODY_CHARS: usize = 1000;
 const MAX_JSON_CONTEXT_NODES: usize = 48;
+const MAX_JSON_FIELD_CONTEXT_FIELDS: usize = 160;
+const MAX_JSON_FIELD_MATCHES: usize = 16;
+const MAX_JSON_FIELD_ARRAY_ITEMS: usize = 6;
+const MAX_JSON_FIELD_DEPTH: usize = 5;
+const MAX_JSON_FIELD_VISITED_NODES: usize = 3_000;
 const MAX_AGENT_SEARCH_FLOWS: usize = 100;
 const SEARCH_BATCH_SIZE: usize = 10;
 const MAX_SEARCH_BATCHES: usize = 10;
@@ -1297,7 +1302,7 @@ fn body_for_context(flow: &CaptureFlow, direction: &str) -> String {
         );
     }
     if body.chars().count() > MAX_BODY_CHARS {
-        if let Some(summary) = summarize_json_body_for_context(body) {
+        if let Some(summary) = summarize_json_body_for_context(body, direction) {
             return summary;
         }
     }
@@ -1667,6 +1672,95 @@ fn json_primitive_preview(value: &Value) -> Option<String> {
     }
 }
 
+fn collect_json_primitive_field_context(
+    value: &Value,
+    path: &str,
+    depth: usize,
+    visited_nodes: &mut usize,
+    result: &mut Vec<AgentEvidenceField>,
+    limit: usize,
+) {
+    if result.len() >= limit || *visited_nodes >= MAX_JSON_FIELD_VISITED_NODES {
+        return;
+    }
+    *visited_nodes += 1;
+
+    match value {
+        Value::Array(items) => {
+            if depth >= MAX_JSON_FIELD_DEPTH {
+                return;
+            }
+            for (index, item) in items.iter().take(MAX_JSON_FIELD_ARRAY_ITEMS).enumerate() {
+                collect_json_primitive_field_context(
+                    item,
+                    &format!("{path}[{index}]"),
+                    depth + 1,
+                    visited_nodes,
+                    result,
+                    limit,
+                );
+                if result.len() >= limit || *visited_nodes >= MAX_JSON_FIELD_VISITED_NODES {
+                    return;
+                }
+            }
+        }
+        Value::Object(map) => {
+            if depth >= MAX_JSON_FIELD_DEPTH {
+                return;
+            }
+            for (key, item) in map {
+                let next_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                collect_json_primitive_field_context(
+                    item,
+                    &next_path,
+                    depth + 1,
+                    visited_nodes,
+                    result,
+                    limit,
+                );
+                if result.len() >= limit || *visited_nodes >= MAX_JSON_FIELD_VISITED_NODES {
+                    return;
+                }
+            }
+        }
+        Value::Null => {}
+        _ => {
+            let value_text = content_to_text(value.clone());
+            if !value_text.is_empty() {
+                result.push(AgentEvidenceField {
+                    label: path.to_string(),
+                    value: truncate(&value_text, 240),
+                });
+            }
+        }
+    }
+}
+
+fn json_body_fields_for_context(
+    body: &str,
+    root_label: &str,
+    limit: usize,
+) -> Vec<AgentEvidenceField> {
+    let Some(parsed) = try_parse_json(body) else {
+        return Vec::new();
+    };
+    let mut fields = Vec::new();
+    let mut visited_nodes = 0;
+    collect_json_primitive_field_context(
+        &parsed,
+        root_label,
+        0,
+        &mut visited_nodes,
+        &mut fields,
+        limit,
+    );
+    fields
+}
+
 fn collect_json_context_nodes(value: &Value, path: &str, depth: usize, result: &mut Vec<Value>) {
     if result.len() >= MAX_JSON_CONTEXT_NODES {
         return;
@@ -1726,16 +1820,26 @@ fn collect_json_context_nodes(value: &Value, path: &str, depth: usize, result: &
     }
 }
 
-fn summarize_json_body_for_context(body: &str) -> Option<String> {
+fn summarize_json_body_for_context(body: &str, direction: &str) -> Option<String> {
     let parsed = try_parse_json(body)?;
     let mut nodes = Vec::new();
     collect_json_context_nodes(&parsed, "$", 0, &mut nodes);
+    let fields = json_body_fields_for_context(
+        body,
+        if direction == "request" {
+            "requestBody"
+        } else {
+            "responseBody"
+        },
+        MAX_JSON_FIELD_CONTEXT_FIELDS,
+    );
     Some(
         json!({
             "mode": "json_tree_summary",
             "note": "Large JSON body summarized as a DevTools-like tree. Use nodes, key counts, lengths, and identityHints instead of assuming the body only contains the first raw characters.",
             "originalPreviewChars": body.chars().count(),
-            "nodes": nodes
+            "nodes": nodes,
+            "fields": fields
         })
         .to_string(),
     )
@@ -1901,6 +2005,23 @@ fn normalize_search_text(value: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn is_short_ascii_lookup(term: &str) -> bool {
+    term.chars().count() <= 3
+        && term
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        && term.chars().any(|ch| ch.is_ascii_alphabetic())
+}
+
+fn normalized_text_contains_term(normalized_text: &str, term: &str) -> bool {
+    if is_short_ascii_lookup(term) {
+        return normalized_text
+            .split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+            .any(|token| token == term);
+    }
+    normalized_text.contains(term)
 }
 
 fn is_low_signal_term(term: &str) -> bool {
@@ -2348,6 +2469,97 @@ fn search_sections(flow: &CaptureFlow) -> Vec<(&'static str, String, f64)> {
     ]
 }
 
+fn is_json_field_search_term(term: &str) -> bool {
+    let trimmed = term.trim_matches(|ch: char| ch == '`' || ch == '"' || ch == '\'');
+    if trimmed.chars().count() < 2 || trimmed.chars().count() > 80 {
+        return false;
+    }
+    if trimmed
+        .chars()
+        .any(|ch| matches!(ch, '/' | '?' | '=' | '&' | ':' | '\\'))
+    {
+        return false;
+    }
+    trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        && trimmed
+            .chars()
+            .any(|ch| ch.is_ascii_alphabetic() || ch == '_')
+}
+
+fn field_leaf(label: &str) -> String {
+    label
+        .rsplit('.')
+        .next()
+        .unwrap_or(label)
+        .split('[')
+        .next()
+        .unwrap_or(label)
+        .trim_matches(|ch| ch == '[' || ch == ']')
+        .to_ascii_lowercase()
+}
+
+fn json_field_matches_term(field: &AgentEvidenceField, term: &str) -> Option<&'static str> {
+    if !is_json_field_search_term(term) {
+        return None;
+    }
+    let term = term.to_ascii_lowercase();
+    let label = field.label.to_ascii_lowercase();
+    let leaf = field_leaf(&field.label);
+    let normalized_label = normalize_search_text(&field.label);
+    if leaf == term
+        || label == term
+        || label.ends_with(&format!(".{term}"))
+        || normalized_text_contains_term(&normalized_label, &term)
+    {
+        return Some("field");
+    }
+    let normalized_value = normalize_search_text(&field.value);
+    if term.chars().count() >= 3 && normalized_text_contains_term(&normalized_value, &term) {
+        return Some("value");
+    }
+    None
+}
+
+fn json_field_matches_for_terms(
+    flow: &CaptureFlow,
+    terms: &[String],
+    limit: usize,
+) -> Vec<(String, &'static str, AgentEvidenceField)> {
+    let field_terms = terms
+        .iter()
+        .filter(|term| is_json_field_search_term(term))
+        .cloned()
+        .collect::<Vec<_>>();
+    if field_terms.is_empty() {
+        return Vec::new();
+    }
+
+    let fields = [
+        json_body_fields_for_context(&flow.request_body_preview, "requestBody", 240),
+        json_body_fields_for_context(&flow.response_body_preview, "responseBody", 240),
+    ]
+    .concat();
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for field in fields {
+        for term in &field_terms {
+            let Some(match_kind) = json_field_matches_term(&field, term) else {
+                continue;
+            };
+            let key = format!("{term}:{match_kind}:{}={}", field.label, field.value);
+            if seen.insert(key) {
+                result.push((term.clone(), match_kind, field.clone()));
+            }
+            if result.len() >= limit {
+                return result;
+            }
+        }
+    }
+    result
+}
+
 fn compact_text(value: &str, limit: usize) -> String {
     truncate(
         &value
@@ -2381,7 +2593,7 @@ fn search_snippets(flow: &CaptureFlow, terms: &[String], max_items: usize) -> Ve
         let normalized = normalize_search_text(&text);
         let matched = terms
             .iter()
-            .find(|term| term.len() >= 2 && normalized.contains(term.as_str()));
+            .find(|term| term.len() >= 2 && normalized_text_contains_term(&normalized, term));
         if let Some(term) = matched {
             snippets.push(json!({
                 "section": section,
@@ -2391,6 +2603,22 @@ fn search_snippets(flow: &CaptureFlow, terms: &[String], max_items: usize) -> Ve
         }
         if snippets.len() >= max_items {
             break;
+        }
+    }
+    if snippets.len() < max_items {
+        for (term, match_kind, field) in
+            json_field_matches_for_terms(flow, &terms, max_items.saturating_sub(snippets.len()))
+        {
+            snippets.push(json!({
+                "section": "jsonField",
+                "term": term,
+                "match": match_kind,
+                "field": field.label,
+                "value": field.value
+            }));
+            if snippets.len() >= max_items {
+                break;
+            }
         }
     }
     snippets
@@ -2496,7 +2724,9 @@ fn rank_search_candidates(
                 }
             }
             for field in &profile.fields {
-                if normalized_body.contains(field) || normalized_headers.contains(field) {
+                if normalized_text_contains_term(&normalized_body, field)
+                    || normalized_text_contains_term(&normalized_headers, field)
+                {
                     score += 76.0;
                     reasons.push(format!("field matched `{field}`"));
                 }
@@ -2630,7 +2860,7 @@ fn match_flow_against_terms(
         }
         let mut best: Option<(&str, f64)> = None;
         for (section, weight) in sections {
-            if flow_section_text(flow, section).contains(term) {
+            if normalized_text_contains_term(&flow_section_text(flow, section), term) {
                 if best
                     .map(|(_, best_weight)| weight > best_weight)
                     .unwrap_or(true)
@@ -2644,6 +2874,19 @@ fn match_flow_against_terms(
             if reasons.len() < 12 {
                 reasons.push(format!("{section} matched `{term}`"));
             }
+        }
+    }
+
+    for (term, match_kind, field) in
+        json_field_matches_for_terms(flow, terms, MAX_JSON_FIELD_MATCHES)
+    {
+        let weight = if match_kind == "field" { 72.0 } else { 22.0 };
+        score += weight;
+        if reasons.len() < 12 {
+            reasons.push(format!(
+                "json {match_kind} matched `{term}` at `{}`",
+                field.label
+            ));
         }
     }
 
@@ -3470,10 +3713,11 @@ fn build_final_user_content(question: &str, context: &Value) -> Value {
 mod tests {
     use super::{
         build_agent_context, build_stream_structured_answer, build_text_search_profile,
-        rank_search_candidates, retrieve_evidence_candidates, EvidenceSearchProfile,
-        SearchResolution,
+        rank_search_candidates, retrieve_evidence_candidates, summarize_flow,
+        EvidenceSearchProfile, SearchResolution,
     };
     use crate::models::CaptureFlow;
+    use serde_json::{json, Value};
     use std::collections::{HashMap, HashSet};
 
     fn flow(
@@ -3517,6 +3761,83 @@ mod tests {
             sse_events: Vec::new(),
             tags: tags.into_iter().map(String::from).collect(),
         }
+    }
+
+    fn video_page_body(include_vid: bool) -> String {
+        let mut item = serde_json::Map::new();
+        for index in 0..120 {
+            item.insert(
+                format!("field_{index:03}"),
+                json!(format!("placeholder-value-{index:03}")),
+            );
+        }
+        item.insert("id".into(), json!(35592));
+        item.insert("uid".into(), json!("0bd2f8a5acd443d28d88566e88b23301"));
+        if include_vid {
+            item.insert("vid".into(), json!("0044d3f1-05c2-452c-a746-33efd813576d"));
+        }
+        item.insert("video_url".into(), Value::Null);
+        serde_json::to_string(&json!([Value::Object(item)])).expect("serialize test body")
+    }
+
+    #[test]
+    fn long_json_context_keeps_late_primitive_fields() {
+        let video = flow(
+            "video-page",
+            2_000,
+            "api.example.test",
+            "/overseas-agent/api/video/page",
+            &video_page_body(true),
+            vec![],
+        );
+
+        let summary = summarize_flow(&video);
+        let response_body = summary
+            .get("responseBody")
+            .and_then(Value::as_str)
+            .expect("response body summary");
+
+        assert!(response_body.contains("responseBody[0].vid"));
+        assert!(response_body.contains("0044d3f1-05c2-452c-a746-33efd813576d"));
+    }
+
+    #[test]
+    fn field_lookup_prefers_json_field_match_over_path_substring() {
+        let without_vid = flow(
+            "video-list-without-vid",
+            3_000,
+            "api.example.test",
+            "/overseas-agent/api/video/page",
+            &video_page_body(false),
+            vec![],
+        );
+        let with_vid = flow(
+            "video-list-with-vid",
+            2_000,
+            "api.example.test",
+            "/overseas-agent/api/video/page",
+            &video_page_body(true),
+            vec![],
+        );
+        let profile = build_text_search_profile("为什么查不到 vid 字段", "");
+
+        let candidates = rank_search_candidates(
+            &[without_vid, with_vid],
+            "为什么查不到 vid 字段",
+            "",
+            &profile,
+            false,
+            &HashSet::new(),
+        );
+
+        assert_eq!(
+            candidates.first().map(|item| item.flow.id.as_str()),
+            Some("video-list-with-vid")
+        );
+        assert!(candidates[0].snippets.iter().any(|snippet| {
+            snippet.get("section").and_then(Value::as_str) == Some("jsonField")
+                && snippet.get("field").and_then(Value::as_str) == Some("responseBody[0].vid")
+        }));
     }
 
     #[test]

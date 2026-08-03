@@ -187,8 +187,11 @@ const defaultStructuredFilters: StructuredFilters = {
 };
 
 const localSessionKey = "dpa-auto-session-v1";
-const localSessionFlowLimit = 250;
-const localSessionTextLimit = 64 * 1024;
+const localSessionFlowLimit = 80;
+const localSessionFallbackFlowLimit = 30;
+const localSessionTextLimit = 8 * 1024;
+const localSessionSaveDelayMs = 2_000;
+const slowNativeRefreshIntervalMs = 30_000;
 const requestColumnStorageKey = "dpa-request-columns-v2";
 const requestColumnKeys: RequestColumnKey[] = ["status", "type", "size", "captured", "duration"];
 const defaultRequestColumnVisibility: RequestColumnVisibility = {
@@ -950,7 +953,7 @@ function writeLocalSession(flows: CaptureFlow[], rules: ProxyRule[], weakNetwork
     window.localStorage.setItem(localSessionKey, makePayload(localSessionFlowLimit));
   } catch {
     try {
-      window.localStorage.setItem(localSessionKey, makePayload(80));
+      window.localStorage.setItem(localSessionKey, makePayload(localSessionFallbackFlowLimit));
     } catch {
       window.localStorage.removeItem(localSessionKey);
     }
@@ -2871,6 +2874,9 @@ export function App() {
   const agentInputRef = useRef<HTMLTextAreaElement | null>(null);
   const workspaceRef = useRef<HTMLElement | null>(null);
   const hasBootstrappedSessionRef = useRef(false);
+  const refreshInFlightRef = useRef(false);
+  const lastSlowNativeRefreshRef = useRef(0);
+  const flowRevisionRef = useRef<string | null>(null);
   const locatedFlowTimerRef = useRef<number | null>(null);
   const bodyPrefetchKeysRef = useRef<Set<string>>(new Set());
   const activeAgentRunRef = useRef<{ id: string; cancelled: boolean; messageIds: string[] } | null>(null);
@@ -3184,34 +3190,51 @@ export function App() {
     window.requestAnimationFrame(() => agentInputRef.current?.focus());
   }
 
-  async function refresh() {
+  async function refresh(options: { forceSlowNative?: boolean } = {}) {
+    if (refreshInFlightRef.current) {
+      return;
+    }
+    refreshInFlightRef.current = true;
     try {
-      const [
-        nextStatus,
-        nextFlows,
-        nextCertInfo,
-        nextSystemProxy,
-        nextRules,
-        nextWeakNetwork,
-        nextBreakpoints,
-      ] = await Promise.all([
+      const now = Date.now();
+      const shouldRefreshSlowNative =
+        options.forceSlowNative || now - lastSlowNativeRefreshRef.current >= slowNativeRefreshIntervalMs;
+      if (shouldRefreshSlowNative) {
+        lastSlowNativeRefreshRef.current = now;
+      }
+
+      const [nextStatus, nextFlowSnapshot, nextRules, nextWeakNetwork, nextBreakpoints, slowNativeState] = await Promise.all([
         desktopBackend.proxy.status(),
-        desktopBackend.proxy.flows(),
-        desktopBackend.cert.info(),
-        desktopBackend.systemProxy.status().catch(() => null),
+        desktopBackend.proxy.flows({ knownRevision: flowRevisionRef.current }),
         desktopBackend.proxy.rules(),
         desktopBackend.proxy.weakNetwork(),
         desktopBackend.proxy.breakpoints(),
+        shouldRefreshSlowNative
+          ? Promise.all([
+              desktopBackend.cert.info().catch(() => null),
+              desktopBackend.systemProxy.status().catch(() => null),
+            ])
+          : Promise.resolve(null),
       ]);
       setStatus(nextStatus);
-      setFlows(nextFlows);
-      setCertInfo(nextCertInfo);
-      setSystemProxy(nextSystemProxy);
+      flowRevisionRef.current = nextFlowSnapshot.revision;
+      if (nextFlowSnapshot.changed) {
+        setFlows(nextFlowSnapshot.flows);
+      }
       setProxyRules(nextRules.map(normalizeStoredRule));
       setWeakNetwork(nextWeakNetwork);
       setBreakpoints(nextBreakpoints);
+      if (slowNativeState) {
+        const [nextCertInfo, nextSystemProxy] = slowNativeState;
+        if (nextCertInfo) {
+          setCertInfo(nextCertInfo);
+        }
+        setSystemProxy(nextSystemProxy);
+      }
     } catch (refreshError) {
       setError(refreshError instanceof Error ? refreshError.message : String(refreshError));
+    } finally {
+      refreshInFlightRef.current = false;
     }
   }
 
@@ -3223,6 +3246,7 @@ export function App() {
         setSystemProxy(await desktopBackend.systemProxy.apply());
       }
       await desktopBackend.proxy.clear();
+      flowRevisionRef.current = null;
       setFlows([]);
       setSelectedId(null);
       setReplayResult(null);
@@ -3269,7 +3293,7 @@ export function App() {
       if (result.systemProxyError) {
         setError(`代理已启动，但系统代理接入失败：${result.systemProxyError}`);
       }
-      await refresh();
+      await refresh({ forceSlowNative: true });
     }
   }
 
@@ -3298,7 +3322,7 @@ export function App() {
           buildCertTrustFailureDialog("证书仍未被系统信任", message, nextCertInfo.certPath || certInfo?.certPath || ""),
         );
       }
-      await refresh();
+      await refresh({ forceSlowNative: true });
     } catch (actionError) {
       await waitForMinimumDuration();
       const message = asErrorMessage(actionError);
@@ -4217,6 +4241,7 @@ export function App() {
         throw new Error("Session 文件缺少 flows 数组。");
       }
       const importedFlows = await desktopBackend.proxy.importFlows({ flows: payload.flows.map(normalizeStoredFlow) });
+      flowRevisionRef.current = null;
       setFlows(importedFlows);
       if (Array.isArray(payload.rules)) {
         setProxyRules((await desktopBackend.proxy.setRules({ rules: payload.rules.map(normalizeStoredRule) })).map(normalizeStoredRule));
@@ -4251,10 +4276,17 @@ export function App() {
           (nextConfig.captureHosts.length ? nextConfig.captureHosts : nextConfig.sslProxyHosts).join(", "),
         );
 
-        const currentFlows = await desktopBackend.proxy.flows().catch(() => [] as CaptureFlow[]);
+        const currentSnapshot = await desktopBackend.proxy.flows().catch(() => ({
+          revision: "",
+          changed: true,
+          flows: [] as CaptureFlow[],
+        }));
+        flowRevisionRef.current = currentSnapshot.revision || null;
+        const currentFlows = currentSnapshot.flows;
         const stored = readLocalSession();
         if (!cancelled && currentFlows.length === 0 && stored?.flows.length) {
           const importedFlows = await desktopBackend.proxy.importFlows({ flows: stored.flows });
+          flowRevisionRef.current = null;
           setFlows(importedFlows);
           setSelectedId(importedFlows[0]?.id ?? null);
           if (stored.rules.length) {
@@ -4271,7 +4303,7 @@ export function App() {
       } finally {
         if (!cancelled) {
           hasBootstrappedSessionRef.current = true;
-          refresh();
+          void refresh({ forceSlowNative: true });
         }
       }
     }
@@ -4320,7 +4352,10 @@ export function App() {
     if (!hasBootstrappedSessionRef.current) {
       return;
     }
-    writeLocalSession(flows, proxyRules, weakNetwork);
+    const timer = window.setTimeout(() => {
+      writeLocalSession(flows, proxyRules, weakNetwork);
+    }, localSessionSaveDelayMs);
+    return () => window.clearTimeout(timer);
   }, [flows, proxyRules, weakNetwork]);
 
   useEffect(() => {
@@ -4602,6 +4637,7 @@ export function App() {
               className="icon-button icon-only clear-toolbar-button"
               onClick={() =>
                 runAction("clear", () => desktopBackend.proxy.clear()).then(() => {
+                  flowRevisionRef.current = null;
                   setReplayResult(null);
                   setFullBodies({});
                   refresh();
@@ -4759,7 +4795,7 @@ export function App() {
                   placeholder={copy.filterPlaceholder}
                 />
               </div>
-              <button className="square-button" onClick={refresh} title="Refresh">
+              <button className="square-button" onClick={() => refresh({ forceSlowNative: true })} title="Refresh">
                 <RefreshCcw size={15} />
               </button>
               <div className="column-menu-wrap" ref={columnMenuRef}>

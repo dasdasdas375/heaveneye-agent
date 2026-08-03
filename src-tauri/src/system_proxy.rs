@@ -37,6 +37,10 @@ struct WindowsProxySnapshot {
     proxy_enable: Option<u32>,
     proxy_server: Option<String>,
     proxy_override: Option<String>,
+    #[serde(default)]
+    auto_config_url: Option<String>,
+    #[serde(default)]
+    auto_detect: Option<u32>,
 }
 
 impl SystemProxyManager {
@@ -75,7 +79,7 @@ impl SystemProxyManager {
         capture_hosts: &[String],
     ) -> Result<SystemProxyStatus, String> {
         if cfg!(target_os = "windows") {
-            return self.apply_windows(target_port);
+            return self.apply_windows(target_port, capture_hosts);
         }
         if !cfg!(target_os = "macos") {
             return Ok(self.unsupported_status(target_port));
@@ -107,6 +111,9 @@ impl SystemProxyManager {
     }
 
     pub fn cleanup_stale(&self, target_port: u16) -> Result<SystemProxyStatus, String> {
+        if cfg!(target_os = "windows") {
+            return self.cleanup_stale_windows(target_port);
+        }
         if !cfg!(target_os = "macos") {
             return Ok(self.unsupported_status(target_port));
         }
@@ -216,18 +223,24 @@ impl SystemProxyManager {
         let enabled = settings.proxy_enable.unwrap_or(0) != 0;
         let (http, https, socks) =
             parse_windows_proxy_settings(enabled, settings.proxy_server.as_deref().unwrap_or(""));
+        let auto_proxy = windows_auto_proxy_setting(settings.auto_config_url.as_deref());
+        let auto_discovery_enabled = settings.auto_detect.unwrap_or(0) != 0;
         Ok(self.build_status(
             WINDOWS_SERVICE_NAME.to_string(),
             target_port,
             http,
             https,
             socks,
-            empty_url_setting(),
-            false,
+            auto_proxy,
+            auto_discovery_enabled,
         ))
     }
 
-    fn apply_windows(&self, target_port: u16) -> Result<SystemProxyStatus, String> {
+    fn apply_windows(
+        &self,
+        target_port: u16,
+        capture_hosts: &[String],
+    ) -> Result<SystemProxyStatus, String> {
         if !self.snapshot_path.exists() {
             let snapshot = SystemProxySnapshot {
                 service: WINDOWS_SERVICE_NAME.to_string(),
@@ -241,8 +254,31 @@ impl SystemProxyManager {
             self.write_snapshot(&snapshot)?;
         }
 
-        set_windows_proxy(target_port)?;
+        set_windows_pac(target_port, capture_hosts)?;
         self.status(target_port)
+    }
+
+    fn cleanup_stale_windows(&self, target_port: u16) -> Result<SystemProxyStatus, String> {
+        if local_proxy_reachable(target_port) {
+            return self.status(target_port);
+        }
+
+        let status = self.status(target_port)?;
+        if !status.managed_proxy_active {
+            let _ = fs::remove_file(&self.snapshot_path);
+            return Ok(status);
+        }
+
+        if self.snapshot_path.exists() {
+            return self.restore_windows(target_port);
+        }
+
+        disable_matching_windows_proxy(target_port)?;
+        let mut status = self.status(target_port)?;
+        status.message = format!(
+            "Removed stale HeavenEye Agent proxy settings for {TARGET_HOST}:{target_port}."
+        );
+        Ok(status)
     }
 
     fn restore_windows(&self, target_port: u16) -> Result<SystemProxyStatus, String> {
@@ -635,13 +671,19 @@ $item = Get-ItemProperty -Path $path
 $proxyEnable = $null
 $proxyServer = $null
 $proxyOverride = $null
+$autoConfigUrl = $null
+$autoDetect = $null
 if ($null -ne $item.ProxyEnable) {{ $proxyEnable = [int]$item.ProxyEnable }}
 if ($null -ne $item.ProxyServer) {{ $proxyServer = [string]$item.ProxyServer }}
 if ($null -ne $item.ProxyOverride) {{ $proxyOverride = [string]$item.ProxyOverride }}
+if ($null -ne $item.AutoConfigURL) {{ $autoConfigUrl = [string]$item.AutoConfigURL }}
+if ($null -ne $item.AutoDetect) {{ $autoDetect = [int]$item.AutoDetect }}
 [pscustomobject]@{{
   proxyEnable = $proxyEnable
   proxyServer = $proxyServer
   proxyOverride = $proxyOverride
+  autoConfigUrl = $autoConfigUrl
+  autoDetect = $autoDetect
 }} | ConvertTo-Json -Compress
 "#
     );
@@ -649,18 +691,17 @@ if ($null -ne $item.ProxyOverride) {{ $proxyOverride = [string]$item.ProxyOverri
     serde_json::from_str(output.trim()).map_err(|error| error.to_string())
 }
 
-fn set_windows_proxy(target_port: u16) -> Result<(), String> {
+fn set_windows_pac(target_port: u16, capture_hosts: &[String]) -> Result<(), String> {
     let key = powershell_string(WINDOWS_INTERNET_SETTINGS_KEY);
-    let proxy_server = powershell_string(&format!(
-        "http={TARGET_HOST}:{target_port};https={TARGET_HOST}:{target_port}"
-    ));
+    let pac_url = powershell_string(&desktop_pac_url(target_port, capture_hosts));
     let script = format!(
         r#"
 $ErrorActionPreference = 'Stop'
 $path = {key}
 if (-not (Test-Path $path)) {{ New-Item -Path $path -Force | Out-Null }}
-New-ItemProperty -Path $path -Name ProxyEnable -PropertyType DWord -Value 1 -Force | Out-Null
-New-ItemProperty -Path $path -Name ProxyServer -PropertyType String -Value {proxy_server} -Force | Out-Null
+New-ItemProperty -Path $path -Name ProxyEnable -PropertyType DWord -Value 0 -Force | Out-Null
+New-ItemProperty -Path $path -Name AutoConfigURL -PropertyType String -Value {pac_url} -Force | Out-Null
+New-ItemProperty -Path $path -Name AutoDetect -PropertyType DWord -Value 0 -Force | Out-Null
 {notify}
 "#,
         notify = windows_proxy_refresh_script(),
@@ -683,6 +724,9 @@ fn restore_windows_proxy_snapshot(snapshot: &WindowsProxySnapshot) -> Result<(),
         windows_restore_string_property("ProxyServer", snapshot.proxy_server.as_deref());
     let proxy_override_statement =
         windows_restore_string_property("ProxyOverride", snapshot.proxy_override.as_deref());
+    let auto_config_url_statement =
+        windows_restore_string_property("AutoConfigURL", snapshot.auto_config_url.as_deref());
+    let auto_detect_statement = windows_restore_dword_property("AutoDetect", snapshot.auto_detect);
     let script = format!(
         r#"
 $ErrorActionPreference = 'Stop'
@@ -691,6 +735,56 @@ if (-not (Test-Path $path)) {{ New-Item -Path $path -Force | Out-Null }}
 {proxy_enable_statement}
 {proxy_server_statement}
 {proxy_override_statement}
+{auto_config_url_statement}
+{auto_detect_statement}
+{notify}
+"#,
+        notify = windows_proxy_refresh_script(),
+    );
+    run_powershell(&script).map(|_| ())
+}
+
+fn windows_restore_dword_property(name: &str, value: Option<u32>) -> String {
+    match value {
+        Some(value) => format!(
+            "New-ItemProperty -Path $path -Name {name} -PropertyType DWord -Value {value} -Force | Out-Null",
+            name = powershell_string(name),
+        ),
+        None => format!(
+            "Remove-ItemProperty -Path $path -Name {name} -ErrorAction SilentlyContinue",
+            name = powershell_string(name)
+        ),
+    }
+}
+
+fn windows_auto_proxy_setting(value: Option<&str>) -> SystemProxyUrlSetting {
+    let url = value.unwrap_or_default().trim().to_string();
+    SystemProxyUrlSetting {
+        enabled: !url.is_empty(),
+        url,
+    }
+}
+
+fn disable_matching_windows_proxy(target_port: u16) -> Result<(), String> {
+    let key = powershell_string(WINDOWS_INTERNET_SETTINGS_KEY);
+    let endpoint = powershell_string(&format!("{TARGET_HOST}:{target_port}"));
+    let pac_prefix = powershell_string(&format!("http://{TARGET_HOST}:{target_port}/proxy.pac"));
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$path = {key}
+if (-not (Test-Path $path)) {{ return }}
+$item = Get-ItemProperty -Path $path
+$endpoint = {endpoint}
+$pacPrefix = {pac_prefix}
+$proxyServer = if ($null -ne $item.ProxyServer) {{ [string]$item.ProxyServer }} else {{ '' }}
+$autoConfigUrl = if ($null -ne $item.AutoConfigURL) {{ [string]$item.AutoConfigURL }} else {{ '' }}
+if ($proxyServer -split ';' | Where-Object {{ ($_ -split '=', 2)[-1] -eq $endpoint }}) {{
+  New-ItemProperty -Path $path -Name ProxyEnable -PropertyType DWord -Value 0 -Force | Out-Null
+}}
+if ($autoConfigUrl.StartsWith($pacPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {{
+  Remove-ItemProperty -Path $path -Name AutoConfigURL -ErrorAction SilentlyContinue
+}}
 {notify}
 "#,
         notify = windows_proxy_refresh_script(),
@@ -874,7 +968,7 @@ fn run_networksetup(args: &[&str]) -> Result<String, String> {
 mod tests {
     use super::{
         auto_proxy_matches, parse_auto_discovery_enabled, parse_auto_proxy_setting,
-        parse_proxy_setting, parse_windows_proxy_settings,
+        parse_proxy_setting, parse_windows_proxy_settings, windows_auto_proxy_setting,
     };
 
     #[test]
@@ -939,6 +1033,16 @@ mod tests {
         assert!(!https.enabled);
         assert_eq!(http.host, "127.0.0.1");
         assert_eq!(https.port, Some(9090));
+    }
+
+    #[test]
+    fn windows_pac_setting_is_enabled_only_when_url_exists() {
+        let enabled = windows_auto_proxy_setting(Some("http://127.0.0.1:9090/proxy.pac?v=abc"));
+        let disabled = windows_auto_proxy_setting(None);
+
+        assert!(enabled.enabled);
+        assert!(auto_proxy_matches(&enabled, 9090));
+        assert!(!disabled.enabled);
     }
 
     #[test]
