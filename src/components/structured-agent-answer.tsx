@@ -6,18 +6,8 @@ function normalizedCopyValue(value: string) {
   return value.trim().replace(/\s+/g, "");
 }
 
-function buildNarrativeParagraphs(narrative: string | undefined, summary: string | undefined) {
-  return (narrative || "")
-    .split(/\n{2,}/)
-    .map((part) => part.trim())
-    .filter((part) => part && part !== (summary || "").trim());
-}
-
 export function StructuredAgentAnswer({
-  answer,
-  copiedKey,
-  narrative,
-  onCopy,
+  answer, copiedKey, narrative, onCopy,
 }: {
   answer: AgentStructuredAnswer;
   copiedKey: string | null;
@@ -26,111 +16,63 @@ export function StructuredAgentAnswer({
 }) {
   const highlights = answer.highlights || [];
   const evidence = answer.evidence || [];
-  const analysis = answer.analysis || [];
   const testCases = answer.testCases || [];
+  // Streaming text and structured analysis can be two copies of the same answer.
+  // Prefer the original text, including for previously saved conversations.
+  const body = narrative?.trim() || [answer.summary, ...new Set(answer.analysis || [])]
+    .filter((item, index) => item && (index === 0 || item !== answer.summary)).join("\n\n");
+  const paragraphs = body.split(/\n{2,}/).map((part) => part.trim()).filter(Boolean);
   const highlightedValues = new Set(highlights.map((item) => normalizedCopyValue(item.value)).filter(Boolean));
   const sources = highlights.filter((item) => item.source);
-  const narrativeParagraphs = buildNarrativeParagraphs(narrative, answer.summary);
-  const leadAnalysis = highlights.length ? [] : analysis.slice(0, 3);
-  const detailAnalysis = highlights.length ? analysis : analysis.slice(leadAnalysis.length);
-  const hasLead = Boolean(highlights.length || leadAnalysis.length || answer.summary);
-  const hasDetail = Boolean(narrativeParagraphs.length || detailAnalysis.length || evidence.length || testCases.length);
 
   return (
     <div className="structured-answer">
-      {hasLead ? (
-        <section className="answer-section answer-lead">
-          <div className="answer-section-title">回答要点</div>
-          {answer.summary ? <p className="answer-summary">{answer.summary}</p> : null}
+      {paragraphs.length ? (
+        <section className="answer-section answer-narrative" aria-label="回答">
+          {paragraphs.map((paragraph, index) => (
+            <p className={index === 0 ? "answer-conclusion" : undefined} key={index}>{paragraph}</p>
+          ))}
+        </section>
+      ) : null}
+
+      {highlights.length || evidence.length ? (
+        <details className="answer-sources">
+          <summary>查看接口与字段证据{evidence.length ? `（${evidence.length}）` : ""}</summary>
           <div className="answer-points">
             {highlights.map((item, index) => {
               const copyKey = `highlight-${index}-${item.label}`;
               return (
-                <button
-                  key={copyKey}
-                  type="button"
-                  className={`answer-point ${item.kind || "other"}`}
-                  onClick={() => onCopy(item.value, copyKey)}
-                  title="点击复制"
-                >
+                <button key={copyKey} type="button" className={`answer-point ${item.kind || "other"}`}
+                  onClick={() => onCopy(item.value, copyKey)} title="点击复制">
                   <span className="highlight-label">{item.label}</span>
                   <strong>{item.value}</strong>
-                  <span className="copy-status">
-                    {copiedKey === copyKey ? "已复制" : "复制"}
-                    <Copy size={12} />
-                  </span>
+                  <span className="copy-status">{copiedKey === copyKey ? "已复制" : "复制"}<Copy size={12} /></span>
                 </button>
               );
             })}
-            {!highlights.length && leadAnalysis.length ? (
-              <ul className="analysis-list is-compact">
-                {leadAnalysis.map((item, index) => (
-                  <li key={`${item}-${index}`}>{item}</li>
-                ))}
-              </ul>
-            ) : null}
           </div>
-        </section>
+          <div className="evidence-list">
+            {evidence.map((item, index) => (
+              <EvidenceCard key={`${item.host}-${item.path}-${index}`} item={item} index={index}
+                sources={sources} highlightedValues={highlightedValues} copiedKey={copiedKey} onCopy={onCopy} />
+            ))}
+          </div>
+        </details>
       ) : null}
 
-      {hasDetail ? (
-        <section className="answer-section answer-detail-flow">
-          <div className="answer-section-title">详解</div>
-          {narrativeParagraphs.length ? (
-            <div className="answer-narrative">
-              {narrativeParagraphs.map((paragraph, index) => (
-                <p key={`${paragraph}-${index}`}>{paragraph}</p>
-              ))}
-            </div>
-          ) : null}
-
-          {detailAnalysis.length ? (
-            <div className="answer-detail-block">
-              <div className="answer-detail-title">判断与建议</div>
-              <ul className="analysis-list">
-                {detailAnalysis.map((item, index) => (
-                  <li key={`${item}-${index}`}>{item}</li>
-                ))}
-              </ul>
-            </div>
-          ) : null}
-
-          {testCases.length ? (
-            <div className="answer-detail-block">
-              <div className="answer-detail-title">测试用例</div>
-              <div className="test-case-list">
-                {testCases.map((item, index) => (
-                  <article className="test-case-card" key={`${item.name}-${index}`}>
-                    <strong>{item.name}</strong>
-                    {item.purpose ? <p>{item.purpose}</p> : null}
-                    <div>
-                      {[item.method, item.url].filter(Boolean).join(" ") || "沿用原请求"}
-                    </div>
-                    {item.expected ? <small>{item.expected}</small> : null}
-                  </article>
-                ))}
-              </div>
-            </div>
-          ) : null}
-
-          {evidence.length ? (
-            <div className="answer-detail-block">
-              <div className="answer-detail-title">证据接口</div>
-              <div className="evidence-list">
-                {evidence.map((item, index) => (
-                  <EvidenceCard
-                    key={`${item.host}-${item.path}-${index}`}
-                    item={item}
-                    index={index}
-                    sources={sources}
-                    highlightedValues={highlightedValues}
-                    copiedKey={copiedKey}
-                    onCopy={onCopy}
-                  />
-                ))}
-              </div>
-            </div>
-          ) : null}
+      {testCases.length ? (
+        <section className="answer-detail-block">
+          <div className="answer-detail-title">测试用例</div>
+          <div className="test-case-list">
+            {testCases.map((item, index) => (
+              <article className="test-case-card" key={`${item.name}-${index}`}>
+                <strong>{item.name}</strong>
+                {item.purpose ? <p>{item.purpose}</p> : null}
+                <div>{[item.method, item.url].filter(Boolean).join(" ") || "沿用原请求"}</div>
+                {item.expected ? <small>{item.expected}</small> : null}
+              </article>
+            ))}
+          </div>
         </section>
       ) : null}
     </div>

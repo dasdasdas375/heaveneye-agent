@@ -5,7 +5,30 @@ import { StructuredAgentAnswer } from "../src/components/structured-agent-answer
 import type { AgentStructuredAnswer } from "../src/types";
 
 describe("structured agent answer", () => {
-  it("renders key points before detailed explanation", () => {
+  it("does not repeat streamed sentences as summary and analysis", () => {
+    const conclusion = "当前登录账号的 ID 为 1。";
+    const proof = "依据：\n- GET /api/auth/me 返回 200，responseBody.user.id = 1。";
+    const markup = renderToStaticMarkup(
+      <StructuredAgentAnswer answer={{ summary: conclusion, analysis: [conclusion, proof] }}
+        copiedKey={null} narrative={`${conclusion}\n\n${proof}`} onCopy={() => undefined} />,
+    );
+    expect(markup.split(conclusion)).toHaveLength(2);
+    expect(markup.split("responseBody.user.id = 1")).toHaveLength(2);
+    expect(markup).not.toContain("详解");
+  });
+
+  it("keeps structured-only next steps and test cases", () => {
+    const markup = renderToStaticMarkup(
+      <StructuredAgentAnswer answer={{ summary: "证据不足", analysis: ["证据不足", "请重新抓取登录请求"],
+        testCases: [{ name: "缺少参数", expected: "返回 400" }] }} copiedKey={null} onCopy={() => undefined} />,
+    );
+    expect(markup.split("证据不足")).toHaveLength(2);
+    expect(markup).toContain("请重新抓取登录请求");
+    expect(markup).toContain("缺少参数");
+    expect(markup).toContain("返回 400");
+  });
+
+  it("renders one narrative with evidence collapsed by default", () => {
     const answer: AgentStructuredAnswer = {
       summary: "今日没有失败接口，但视频渲染链路存在明显慢请求。",
       highlights: [
@@ -33,9 +56,10 @@ describe("structured agent answer", () => {
       <StructuredAgentAnswer answer={answer} copiedKey={null} narrative="先给结论，再给排查建议。" onCopy={() => undefined} />,
     );
 
-    expect(markup).toContain("回答要点");
-    expect(markup).toContain("详解");
-    expect(markup.indexOf("回答要点")).toBeLessThan(markup.indexOf("详解"));
+    expect(markup).toContain('<details class="answer-sources">');
+    expect(markup).not.toContain("判断与建议");
+    expect(markup).not.toContain(answer.summary);
+    expect(markup).not.toContain(answer.analysis![0]);
     expect(markup).toContain("先给结论，再给排查建议。");
     expect(markup).toContain("最慢 API");
     expect(markup).toContain("证据接口");

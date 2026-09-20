@@ -245,7 +245,7 @@ fn load_config() -> AppConfig {
                     )
                 }),
                 model: env::var("AI_MODEL")
-                    .unwrap_or_else(|_| env_or_default("QWEN_MODEL", "qwen3.7-max")),
+                    .unwrap_or_else(|_| env_or_default("QWEN_MODEL", "qwen3.8-max")),
                 vision_model: env::var("AI_VISION_MODEL")
                     .unwrap_or_else(|_| env_or_default("QWEN_VISION_MODEL", "qwen3-vl-plus")),
                 has_api_key: env::var("AI_API_KEY")

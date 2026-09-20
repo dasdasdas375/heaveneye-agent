@@ -336,7 +336,7 @@ impl AiService {
                     vec![chat_message(
                         "system",
                         Value::String(
-                            "你是 HeavenEye Agent（天眼抓包 Agent），一个运行在用户本机、面向研发和测试的抓包调试助手。你的职责是替代用户手动翻浏览器 F12 Network：只基于本地抓包上下文、截图提取结果和搜索器证据回答，不要编造，不要输出与抓包证据无关的免责声明、合规说明、风险提醒或注意事项。不要把当前 UI 选中的请求当作默认焦点；只有上下文里的 focusedFlow 非空，才表示用户本轮明确指定接口。searchResult 是应用底层隐藏搜索器和模型分批判断后的结果：如果 selectedFlow 非空，优先围绕 selectedFlow 回答；如果 selectedFlow 为空，必须说明截图/问题显示的意图，以及最多 100 条检索范围内没有找到强匹配接口，不要改用无关旧接口。历史对话只作为追问语境，上一轮助手结论不是证据。用户询问账号、uid、token、header、cookie、报错接口、慢接口时，如果 selectedFlow 或 searchBatches 中真实存在对应字段，就按字段原文和证据接口列出；如果上下文不足，就明确说明还缺少哪些接口。用户要求接口测试时，先基于真实 request 参数、headers、body 和 response 设计低风险用例，再把可执行的参数变体放入 testCases；每个用例必须相对原请求可发送，不要生成破坏性、扣费、删除、批量写入类用例。必须返回严格 JSON，不要 Markdown，不要代码块。JSON 结构为：{\"summary\":\"一句话结论，优先回答用户最关心的问题\",\"highlights\":[{\"label\":\"账号|密码|Token|UID|报错接口|慢接口等\",\"value\":\"可复制的核心值\",\"kind\":\"uid|account|password|token|error|url|field|status|time|other\",\"source\":\"字段来源，如 requestBody.email 或 responseBody.data.token\"}],\"evidence\":[{\"title\":\"证据名称\",\"time\":\"请求时间\",\"method\":\"GET/POST\",\"status\":200,\"host\":\"域名\",\"path\":\"路径和 query\",\"fields\":[{\"label\":\"字段路径\",\"value\":\"字段值\"}]}],\"analysis\":[\"简短分析或下一步\"],\"testCases\":[{\"name\":\"用例名\",\"purpose\":\"为什么测\",\"method\":\"GET/POST，可省略则沿用原请求\",\"url\":\"完整 URL，可省略则沿用原请求\",\"headers\":{\"x-demo\":\"value，可省略\"},\"query\":{\"key\":\"value，可省略\"},\"body\":{\"字段\":\"值；可省略或字符串\"},\"expected\":\"预期状态/字段/行为\"}]}。highlights 必须只放用户最需要复制的核心元素，并放在最前；evidence 只说明这些值从哪个接口、什么时间、什么状态取到，fields 只放未在 highlights 重复展示的补充字段；非接口测试问题不要返回 testCases，接口测试最多 5 个用例。".into(),
+                            "你是 HeavenEye Agent（天眼抓包 Agent），一个运行在用户本机、面向研发和测试的抓包调试助手。你的职责是替代用户手动翻浏览器 F12 Network：只基于本地抓包上下文、截图提取结果和搜索器证据回答，不要编造，不要输出与抓包证据无关的免责声明、合规说明、风险提醒或注意事项。不要把当前 UI 选中的请求当作默认焦点；只有上下文里的 focusedFlow 非空，才表示用户本轮明确指定接口。searchResult 是应用底层隐藏搜索器和模型分批判断后的结果：如果 selectedFlow 非空，优先围绕 selectedFlow 回答；如果 selectedFlow 为空，必须说明截图/问题显示的意图，以及最多 100 条检索范围内没有找到强匹配接口，不要改用无关旧接口。历史对话只作为追问语境，上一轮助手结论不是证据。用户询问账号、uid、token、header、cookie、报错接口、慢接口时，如果 selectedFlow 或 searchBatches 中真实存在对应字段，就按字段原文和证据接口列出；如果上下文不足，就明确说明还缺少哪些接口。用户要求接口测试时，先基于真实 request 参数、headers、body 和 response 设计低风险用例，再把可执行的参数变体放入 testCases；每个用例必须相对原请求可发送，不要生成破坏性、扣费、删除、批量写入类用例。必须返回严格 JSON，不要 Markdown，不要代码块。JSON 结构为：{\"summary\":\"一句话结论，优先回答用户最关心的问题\",\"highlights\":[{\"label\":\"账号|密码|Token|UID|报错接口|慢接口等\",\"value\":\"可复制的核心值\",\"kind\":\"uid|account|password|token|error|url|field|status|time|other\",\"source\":\"字段来源，如 requestBody.email 或 responseBody.data.token\"}],\"evidence\":[{\"title\":\"证据名称\",\"time\":\"请求时间\",\"method\":\"GET/POST\",\"status\":200,\"host\":\"域名\",\"path\":\"路径和 query\",\"fields\":[{\"label\":\"字段路径\",\"value\":\"字段值\"}]}],\"analysis\":[\"简短分析或下一步\"],\"testCases\":[{\"name\":\"用例名\",\"purpose\":\"为什么测\",\"method\":\"GET/POST，可省略则沿用原请求\",\"url\":\"完整 URL，可省略则沿用原请求\",\"headers\":{\"x-demo\":\"value，可省略\"},\"query\":{\"key\":\"value，可省略\"},\"body\":{\"字段\":\"值；可省略或字符串\"},\"expected\":\"预期状态/字段/行为\"}]}。highlights 必须只放用户最需要复制的核心元素，并放在最前；evidence 只说明这些值从哪个接口、什么时间、什么状态取到，fields 只放未在 highlights 重复展示的补充字段；非接口测试问题不要返回 testCases，接口测试最多 5 个用例。表达要简明：summary 用一到两句话直接回答；highlights 最多 3 个用户所问的核心值；evidence 通常 1—3 个；analysis 仅在存在异常或证据缺口时给出最多 2 条下一步，不重复 summary、字段和值。简单查询无需建议或无关背景。".into(),
                         ),
                     )],
                     normalize_history(history),
@@ -1251,7 +1251,7 @@ fn emit_agent_stream_event<F>(
 }
 
 fn agent_stream_text_system_prompt() -> &'static str {
-    "你是 HeavenEye Agent（天眼抓包 Agent），一个运行在用户本机、面向研发和测试的抓包调试助手。请用中文直接回答用户问题，不要输出 JSON，不要 Markdown 代码块。只基于上下文里的 searchIntent、searchResult、selectedFlow、relatedFlowDetails 和 identityHints 回答，不要编造。\n\n强制要求：\n1. 绝对不要只输出“接口用途 / 关键证据 / 简短判断”这类空标题；每个标题后必须有具体内容。若证据不足，直接说缺什么证据。\n2. 如果 selectedFlow 非空，并且用户问“这个接口做什么/用途是什么”，第一句话必须写成：“这个接口是 METHOD PATH，用于……”。用途要从 path、query、requestBody、responseBody、字段名、返回 data/name/description/code/message 等证据综合判断。\n3. 回答必须包含至少 2 条具体证据，例如 status、host、path、query、响应 code/message、data.id/name/description、关键请求参数或响应字段。证据字段和值要写出来。\n4. 如果 selectedFlow 为空，说明最多 100 条内没有找到强匹配接口，并给出下一步该如何重新抓包或缩小范围。\n5. 回答要短，但不能空；优先给结论，然后给证据和判断。"
+    "你是 HeavenEye Agent，本机抓包调试助手。用中文回答，只依据 searchIntent、searchResult、selectedFlow、relatedFlowDetails 和 identityHints；历史回答不是证据，不得编造。\n\n回答格式：\n1. 第一行直接回答问题，用一到两句话给出结论；不要写前言或空标题。\n2. 空一行后写‘依据：’，接 1—3 条简短列表，每条给出真实接口或字段和值。已有一条充分证据时不要凑数。\n3. 只有存在异常或证据缺口时，再用一句‘下一步：’说明可执行操作；正常查询不要泛泛建议。\n4. 简单查询控制在 150 字左右，复杂排查默认不超过 300 字；用户明确要求展开或列全时按需增加。相同结论、字段和值只写一次，不复述用户问题，不输出详解、判断、总结等重复章节，不输出 JSON 或代码围栏。\n5. 用户问 UID 就回答 UID，账号等仅用于必要区分，不罗列无关字段。问接口用途时结合请求和响应解释，不能只根据路径猜测。区分已证实的事实和推测。\n6. selectedFlow 为空时，明确说明本次检索范围内未找到足够证据，指出缺少的接口或字段；不要拿无关接口作答，也不要把局部抓包结果说成全系统结论。"
 }
 
 fn truncate(value: &str, limit: usize) -> String {
@@ -1530,109 +1530,19 @@ fn normalize_structured_answer(
 
 fn format_structured_content(answer: &AgentStructuredAnswer) -> String {
     let mut lines = Vec::new();
-    if let Some(summary) = &answer.summary {
-        if !summary.is_empty() {
-            lines.push(summary.clone());
+    if let Some(summary) = answer
+        .summary
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        lines.push(summary.trim().to_string());
+    }
+    for item in answer.analysis.iter().flatten() {
+        let item = item.trim();
+        if !item.is_empty() && !lines.iter().any(|line| line == item) {
+            lines.push(item.to_string());
         }
     }
-
-    if let Some(highlights) = &answer.highlights {
-        if !highlights.is_empty() {
-            let mut block = vec!["关键结果:".to_string()];
-            for item in highlights {
-                block.push(format!("{}: {}", item.label, item.value));
-            }
-            lines.push(block.join("\n"));
-        }
-    }
-
-    if let Some(evidence) = &answer.evidence {
-        if !evidence.is_empty() {
-            let mut block = vec!["证据:".to_string()];
-            for item in evidence {
-                let status = item
-                    .status
-                    .as_ref()
-                    .map(|value| content_to_text(value.clone()))
-                    .unwrap_or_default();
-                let request = [
-                    item.method.clone().unwrap_or_default(),
-                    status,
-                    item.host.clone().unwrap_or_default(),
-                    item.path.clone().unwrap_or_default(),
-                ]
-                .into_iter()
-                .filter(|part| !part.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
-                let fields = item
-                    .fields
-                    .clone()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|field| format!("{}:{}", field.label, field.value))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                if fields.is_empty() {
-                    block.push(
-                        format!("- {} {}", item.time.clone().unwrap_or_default(), request)
-                            .trim()
-                            .to_string(),
-                    );
-                } else {
-                    block.push(
-                        format!(
-                            "- {} {} fields={}",
-                            item.time.clone().unwrap_or_default(),
-                            request,
-                            fields
-                        )
-                        .trim()
-                        .to_string(),
-                    );
-                }
-            }
-            lines.push(block.join("\n"));
-        }
-    }
-
-    if let Some(analysis) = &answer.analysis {
-        if !analysis.is_empty() {
-            let mut block = vec!["分析:".to_string()];
-            for item in analysis {
-                block.push(format!("- {item}"));
-            }
-            lines.push(block.join("\n"));
-        }
-    }
-
-    if let Some(test_cases) = &answer.test_cases {
-        if !test_cases.is_empty() {
-            let mut block = vec!["接口测试用例:".to_string()];
-            for item in test_cases {
-                let target = [
-                    item.method.clone().unwrap_or_default(),
-                    item.url.clone().unwrap_or_default(),
-                ]
-                .into_iter()
-                .filter(|part| !part.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
-                let expected = item
-                    .expected
-                    .as_ref()
-                    .map(|value| format!(" expected={value}"))
-                    .unwrap_or_default();
-                block.push(
-                    format!("- {} {}{}", item.name, target, expected)
-                        .trim()
-                        .to_string(),
-                );
-            }
-            lines.push(block.join("\n"));
-        }
-    }
-
     lines.join("\n\n")
 }
 
@@ -3605,15 +3515,7 @@ fn build_stream_structured_answer(
             summary: Some(summary),
             highlights: Some(Vec::new()),
             evidence: Some(Vec::new()),
-            analysis: Some(
-                content
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .take(6)
-                    .map(|line| truncate(line, 500))
-                    .collect(),
-            ),
+            analysis: Some(Vec::new()),
             test_cases: Some(Vec::new()),
         };
     };
@@ -3661,15 +3563,6 @@ fn build_stream_structured_answer(
         });
     }
 
-    let analysis = content
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .filter(|line| !line.starts_with('#'))
-        .take(8)
-        .map(|line| truncate(line, 500))
-        .collect::<Vec<_>>();
-
     AgentStructuredAnswer {
         summary: Some(summary),
         highlights: Some(highlights),
@@ -3682,7 +3575,7 @@ fn build_stream_structured_answer(
             path: Some(flow_path_with_query(flow)),
             fields: Some(fields),
         }]),
-        analysis: Some(analysis),
+        analysis: Some(Vec::new()),
         test_cases: Some(Vec::new()),
     }
 }

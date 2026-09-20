@@ -223,7 +223,7 @@ const aiProviderPresets: AiProviderPreset[] = [
     id: "qwen",
     label: "Qwen / DashScope",
     baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    model: "qwen3.7-max",
+    model: "qwen3.8-max",
     visionModel: "qwen3-vl-plus",
   },
   {

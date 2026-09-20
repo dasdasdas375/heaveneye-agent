@@ -4930,3 +4930,26 @@ body.workspace-is-resizing * {
 .theme-paper .json-row svg {
   color: #5f6f80;
 }
+
+/* Concise Agent answers: one narrative, optional evidence. */
+.answer-narrative p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.answer-narrative .answer-conclusion {
+  font-weight: 700;
+  color: var(--text-strong);
+}
+.answer-sources {
+  min-width: 0;
+  border-top: 1px solid var(--line-soft);
+  padding-top: 8px;
+}
+.answer-sources > summary {
+  cursor: pointer;
+  color: var(--muted-strong);
+  font-size: 12px;
+}
+.answer-sources[open] > summary {
+  margin-bottom: 10px;
+}
