@@ -3293,28 +3293,11 @@ export function App() {
       const nextStatus = await desktopBackend.proxy.start();
       try {
         const nextSystemProxy = await desktopBackend.systemProxy.apply();
-        return { nextStatus, nextSystemProxy, systemProxyError: null, captureBrowser: null, captureBrowserError: null };
+        return { nextStatus, nextSystemProxy, systemProxyError: null };
       } catch (systemProxyError) {
         const nextSystemProxy = await desktopBackend.systemProxy.status().catch(() => null);
-        try {
-          const captureBrowser = await desktopBackend.proxy.openBrowser({ target: domainInput });
-          return {
-            nextStatus,
-            nextSystemProxy,
-            systemProxyError: systemProxyError instanceof Error ? systemProxyError.message : String(systemProxyError),
-            captureBrowser,
-            captureBrowserError: null,
-          };
-        } catch (captureBrowserError) {
-          return {
-            nextStatus,
-            nextSystemProxy,
-            systemProxyError: systemProxyError instanceof Error ? systemProxyError.message : String(systemProxyError),
-            captureBrowser: null,
-            captureBrowserError:
-              captureBrowserError instanceof Error ? captureBrowserError.message : String(captureBrowserError),
-          };
-        }
+        return { nextStatus, nextSystemProxy,
+          systemProxyError: systemProxyError instanceof Error ? systemProxyError.message : String(systemProxyError) };
       }
     });
 
@@ -3324,17 +3307,9 @@ export function App() {
         setSystemProxy(result.nextSystemProxy);
       }
       if (result.systemProxyError) {
-        if (result.captureBrowser) {
-          setNotice(
-            `检测到已有系统代理，未修改整机网络；已打开 ${result.captureBrowser.browser} 抓包窗口，仅该窗口使用 ${result.captureBrowser.proxy}。`,
-          );
-        } else {
-          setError(
-            `代理已启动，但系统代理接入失败：${result.systemProxyError}${
-              result.captureBrowserError ? `；抓包浏览器启动失败：${result.captureBrowserError}` : ""
-            }`,
-          );
-        }
+        setError(`代理已启动，但系统代理接入失败：${result.systemProxyError}`);
+      } else {
+        setNotice("已接入系统代理，在现有浏览器刷新目标页面即可抓包；原代理和直连规则已保留，停止时自动恢复。");
       }
       await refresh({ forceSlowNative: true });
     }

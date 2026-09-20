@@ -686,6 +686,13 @@ fn handle_client(
             client_addr,
         )
     } else {
+        let target_url = build_target_url_for_scheme(&request, "http", "")?;
+        if !should_capture_host(
+            target_url.host_str().unwrap_or_default(),
+            &capture_hosts_snapshot,
+        ) {
+            return passthrough_http(request, client_stream, &target_url);
+        }
         handle_forward_http(
             request,
             client_stream,
@@ -697,6 +704,60 @@ fn handle_client(
             client_addr,
         )
     }
+}
+
+// Unselected plain HTTP traffic is streamed without recording, rewriting, weak-network
+// simulation or breakpoints. Unselected HTTPS already uses the opaque CONNECT tunnel.
+fn passthrough_http(
+    request: ParsedRequest,
+    mut client: TcpStream,
+    url: &Url,
+) -> Result<(), String> {
+    let mut upstream = crate::upstream::connect(
+        url.host_str().ok_or("missing host")?,
+        url.port_or_known_default().unwrap_or(80),
+        false,
+    )?;
+    let wire = if is_websocket_upgrade(&request.headers) {
+        websocket_request_wire(&request, url)
+    } else {
+        let mut path = url.path().to_string();
+        if let Some(query) = url.query() {
+            path.push('?');
+            path.push_str(query);
+        }
+        let mut wire = format!("{} {} {}\r\n", request.method, path, request.version);
+        for (key, value) in strip_hop_by_hop_headers(&request.headers) {
+            if !key.eq_ignore_ascii_case("host") && !key.eq_ignore_ascii_case("content-length") {
+                wire.push_str(&format!("{key}: {value}\r\n"));
+            }
+        }
+        wire.push_str(&format!("Host: {}\r\n", authority_for_url(url)));
+        if request_has_body(&request.method, &request.headers, request.body.len()) {
+            wire.push_str(&format!("Content-Length: {}\r\n", request.body.len()));
+        }
+        wire.push_str("Connection: close\r\n\r\n");
+        wire
+    };
+    upstream
+        .write_all(wire.as_bytes())
+        .and_then(|_| upstream.write_all(&request.body))
+        .map_err(|e| e.to_string())?;
+    if is_websocket_upgrade(&request.headers) {
+        let mut reader = client.try_clone().map_err(|e| e.to_string())?;
+        let mut writer = upstream.try_clone().map_err(|e| e.to_string())?;
+        let upload = thread::spawn(move || {
+            let _ = std::io::copy(&mut reader, &mut writer);
+            let _ = writer.shutdown(Shutdown::Write);
+        });
+        let _ = std::io::copy(&mut upstream, &mut client);
+        let _ = client.shutdown(Shutdown::Both);
+        let _ = upstream.shutdown(Shutdown::Both);
+        let _ = upload.join();
+    } else {
+        std::io::copy(&mut upstream, &mut client).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 fn configure_client_stream(client_stream: &TcpStream) -> Result<(), String> {
@@ -1325,7 +1386,7 @@ fn handle_connect(
         }
     }
 
-    match TcpStream::connect((host.as_str(), port)) {
+    match crate::upstream::connect(&host, port, true) {
         Ok(upstream_stream) => {
             client_stream
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -2519,8 +2580,7 @@ fn open_https_response(
         .ok_or_else(|| "missing target host".to_string())?
         .to_string();
     let port = target_url.port_or_known_default().unwrap_or(443);
-    let tcp_stream =
-        TcpStream::connect((host.as_str(), port)).map_err(|error| error.to_string())?;
+    let tcp_stream = crate::upstream::connect(&host, port, true)?;
     tcp_stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .map_err(|error| error.to_string())?;
@@ -3800,8 +3860,7 @@ fn forward_http_request(request: &ParsedRequest, target_url: &Url) -> Result<Vec
         .ok_or_else(|| "missing target host".to_string())?
         .to_string();
     let port = target_url.port_or_known_default().unwrap_or(80);
-    let mut upstream_stream =
-        TcpStream::connect((host.as_str(), port)).map_err(|error| error.to_string())?;
+    let mut upstream_stream = crate::upstream::connect(&host, port, false)?;
     upstream_stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .map_err(|error| error.to_string())?;
@@ -3847,8 +3906,7 @@ fn proxy_websocket_plain(
         .ok_or_else(|| "missing target host".to_string())?
         .to_string();
     let port = target_url.port_or_known_default().unwrap_or(80);
-    let mut upstream_stream =
-        TcpStream::connect((host.as_str(), port)).map_err(|error| error.to_string())?;
+    let mut upstream_stream = crate::upstream::connect(&host, port, false)?;
     set_websocket_timeout(client_stream);
     set_websocket_timeout(&upstream_stream);
 
@@ -3882,8 +3940,7 @@ fn proxy_websocket_tls(
         .ok_or_else(|| "missing target host".to_string())?
         .to_string();
     let port = target_url.port_or_known_default().unwrap_or(443);
-    let tcp_stream =
-        TcpStream::connect((host.as_str(), port)).map_err(|error| error.to_string())?;
+    let tcp_stream = crate::upstream::connect(&host, port, true)?;
     set_websocket_timeout(&tcp_stream);
     set_websocket_timeout(&client_tls_stream.sock);
 
@@ -4996,6 +5053,80 @@ mod tests {
         assert_eq!(
             normalize_capture_hosts(&["https://app.example.test/, *.example.com".to_string()]),
             vec!["app.example.test".to_string(), "*.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn local_http_is_captured_but_unselected_http_is_only_forwarded() {
+        use crate::models::{AppConfig, QwenConfig};
+        use std::io::{Read, Write};
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin_port = origin.local_addr().unwrap().port();
+        let origin_thread = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = origin.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    head.push(byte[0]);
+                }
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nlocal-ok").unwrap();
+            }
+        });
+        let cert_dir = std::env::temp_dir().join(format!("heaveneye-capture-test-{origin_port}"));
+        let config = AppConfig {
+            proxy_port: 0,
+            cert_dir: cert_dir.to_string_lossy().to_string(),
+            capture_hosts: vec!["127.0.0.1".into()],
+            ssl_proxy_hosts: vec![],
+            qwen: QwenConfig {
+                provider: "test".into(),
+                base_url: String::new(),
+                model: String::new(),
+                vision_model: String::new(),
+                has_api_key: false,
+                api_key: String::new(),
+            },
+        };
+        let mut proxy = super::ProxyService::new(&config);
+        proxy.start(Some(0), &config).unwrap();
+        let proxy_port = proxy.port.unwrap();
+        let fetch = || {
+            let mut socket = TcpStream::connect(("127.0.0.1", proxy_port)).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            write!(socket, "GET http://127.0.0.1:{origin_port}/test HTTP/1.1\r\nHost: 127.0.0.1:{origin_port}\r\nConnection: close\r\n\r\n").unwrap();
+            let mut body = String::new();
+            socket.read_to_string(&mut body).unwrap();
+            body
+        };
+        let first = fetch();
+        // The response may reach the client just before the recording is committed.
+        for _ in 0..50 {
+            if !proxy.flow_snapshot(None).flows.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let captured = proxy.flow_snapshot(None).flows;
+        proxy.set_capture_hosts("not-selected.example.test");
+        let second = fetch();
+        let remaining_count = proxy.flow_snapshot(None).flows.len();
+        proxy.stop().unwrap();
+        origin_thread.join().unwrap();
+        let _ = std::fs::remove_dir_all(cert_dir);
+        assert!(first.ends_with("local-ok"));
+        assert!(second.ends_with("local-ok"));
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].status_code, Some(200));
+        assert_eq!(
+            remaining_count, 1,
+            "unselected requests must not be recorded"
         );
     }
 

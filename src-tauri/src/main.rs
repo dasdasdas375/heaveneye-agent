@@ -4,6 +4,7 @@ mod models;
 mod proxy;
 mod replay;
 mod system_proxy;
+mod upstream;
 
 use ai::AiService;
 use certs::CertificateService;
@@ -272,6 +273,11 @@ fn restore_system_proxy_on_exit(app_handle: &tauri::AppHandle) {
     let target_port = {
         let mut proxy = state.proxy.lock().expect("proxy mutex poisoned");
         let port = proxy.status(&config).port;
+        let _ = state
+            .system_proxy
+            .lock()
+            .expect("system proxy mutex poisoned")
+            .restore(port);
         let _ = proxy.stop();
         port
     };
@@ -308,6 +314,11 @@ fn proxy_stop(state: tauri::State<AppState>) -> Result<models::ProxyStatus, Stri
     let config = config_snapshot(&state);
     let mut proxy = state.proxy.lock().expect("proxy mutex poisoned");
     let target_port = proxy.status(&config).port;
+    state
+        .system_proxy
+        .lock()
+        .expect("system proxy mutex poisoned")
+        .restore(target_port)?;
     proxy.stop()?;
     let status = proxy.status(&config);
     drop(proxy);

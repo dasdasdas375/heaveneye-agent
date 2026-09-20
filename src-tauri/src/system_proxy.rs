@@ -245,10 +245,32 @@ impl SystemProxyManager {
     fn apply_windows(
         &self,
         target_port: u16,
-        capture_hosts: &[String],
+        _capture_hosts: &[String],
     ) -> Result<SystemProxyStatus, String> {
         let current = read_windows_proxy_snapshot()?;
-        reject_conflicting_windows_proxy(&current, target_port)?;
+        let original = self
+            .read_snapshot()?
+            .and_then(|snapshot| snapshot.windows)
+            .unwrap_or(current.clone());
+        reject_conflicting_windows_proxy(&original, target_port)?;
+        let (http, https, _) = parse_windows_proxy_settings(
+            original.proxy_enable.unwrap_or(0) != 0,
+            original.proxy_server.as_deref().unwrap_or_default(),
+        );
+        let routes = crate::upstream::Routes {
+            http: crate::upstream::endpoint(&http, target_port)?,
+            https: crate::upstream::endpoint(&https, target_port)?,
+            bypass: original
+                .proxy_override
+                .as_deref()
+                .unwrap_or_default()
+                .split(';')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect(),
+            listener_port: target_port,
+        };
         if !self.snapshot_path.exists() {
             let snapshot = SystemProxySnapshot {
                 service: WINDOWS_SERVICE_NAME.to_string(),
@@ -262,7 +284,13 @@ impl SystemProxyManager {
             self.write_snapshot(&snapshot)?;
         }
 
-        set_windows_pac(target_port, capture_hosts)?;
+        crate::upstream::configure(routes);
+        if let Err(error) = set_windows_manual_proxy(target_port) {
+            if restore_windows_proxy_snapshot(&original).is_ok() {
+                let _ = fs::remove_file(&self.snapshot_path);
+            }
+            return Err(error);
+        }
         if let Err(error) = self.ensure_windows_watchdog(target_port) {
             let _ = self.restore_windows(target_port);
             return Err(format!("系统代理安全守护启动失败，已回滚代理设置：{error}"));
@@ -326,6 +354,13 @@ impl SystemProxyManager {
     }
 
     fn restore_windows(&self, target_port: u16) -> Result<SystemProxyStatus, String> {
+        // A VPN or the user may have changed settings during capture. Do not overwrite
+        // that newer configuration when stopping HeavenEye.
+        let current_status = self.status(target_port)?;
+        if !current_status.managed_proxy_active {
+            let _ = fs::remove_file(&self.snapshot_path);
+            return Ok(current_status);
+        }
         let Some(snapshot) = self.read_snapshot()? else {
             let mut status = self.status(target_port)?;
             status.message = "No system proxy snapshot is available to restore.".to_string();
@@ -545,21 +580,20 @@ fn reject_conflicting_windows_proxy(
                 .to_string(),
         );
     }
+    if settings.auto_detect == Some(1) {
+        return Err("当前启用了自动发现代理，暂不能安全串联；请先确认原代理的 HTTP 配置。".into());
+    }
 
     let enabled = settings.proxy_enable.unwrap_or(0) != 0;
     let (http, https, socks) =
         parse_windows_proxy_settings(enabled, settings.proxy_server.as_deref().unwrap_or(""));
-    let conflicts = [&http, &https, &socks].into_iter().any(|setting| {
-        setting.enabled
-            && !(setting.host.eq_ignore_ascii_case(TARGET_HOST)
-                && setting.port == Some(target_port))
-    });
-    if conflicts {
+    if socks.enabled && (!http.enabled || !https.enabled) {
         return Err(
-            "检测到已有系统代理。为避免中断整台电脑的网络，HeavenEye 已取消覆盖；请先关闭现有代理，或在目标浏览器中单独配置 127.0.0.1 代理。"
-                .to_string(),
+            "原代理只有 SOCKS 路由，暂不能安全串联；请将原代理切换到 HTTP/混合端口模式。".into(),
         );
     }
+    crate::upstream::endpoint(&http, target_port)?;
+    crate::upstream::endpoint(&https, target_port)?;
     Ok(())
 }
 
@@ -786,17 +820,19 @@ if ($null -ne $item.AutoDetect) {{ $autoDetect = [int]$item.AutoDetect }}
     serde_json::from_str(output.trim()).map_err(|error| error.to_string())
 }
 
-fn set_windows_pac(target_port: u16, capture_hosts: &[String]) -> Result<(), String> {
+fn set_windows_manual_proxy(target_port: u16) -> Result<(), String> {
     let key = powershell_string(WINDOWS_INTERNET_SETTINGS_KEY);
-    let pac_url = powershell_string(&desktop_pac_url(target_port, capture_hosts));
+    let endpoint = powershell_string(&format!("{TARGET_HOST}:{target_port}"));
     let script = format!(
         r#"
 $ErrorActionPreference = 'Stop'
 $path = {key}
 if (-not (Test-Path $path)) {{ New-Item -Path $path -Force | Out-Null }}
-New-ItemProperty -Path $path -Name ProxyEnable -PropertyType DWord -Value 0 -Force | Out-Null
-New-ItemProperty -Path $path -Name AutoConfigURL -PropertyType String -Value {pac_url} -Force | Out-Null
+New-ItemProperty -Path $path -Name ProxyServer -PropertyType String -Value {endpoint} -Force | Out-Null
+New-ItemProperty -Path $path -Name ProxyOverride -PropertyType String -Value '<-loopback>' -Force | Out-Null
+Remove-ItemProperty -Path $path -Name AutoConfigURL -ErrorAction SilentlyContinue
 New-ItemProperty -Path $path -Name AutoDetect -PropertyType DWord -Value 0 -Force | Out-Null
+New-ItemProperty -Path $path -Name ProxyEnable -PropertyType DWord -Value 1 -Force | Out-Null
 {notify}
 "#,
         notify = windows_proxy_refresh_script(),
@@ -1167,7 +1203,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_system_proxy_does_not_overwrite_an_existing_proxy() {
+    fn windows_system_proxy_can_chain_an_existing_http_proxy() {
         let settings = WindowsProxySnapshot {
             proxy_enable: Some(1),
             proxy_server: Some("127.0.0.1:7890".to_string()),
@@ -1175,7 +1211,7 @@ mod tests {
             auto_config_url: None,
             auto_detect: None,
         };
-        assert!(reject_conflicting_windows_proxy(&settings, 9090).is_err());
+        assert!(reject_conflicting_windows_proxy(&settings, 9090).is_ok());
     }
 
     #[test]
