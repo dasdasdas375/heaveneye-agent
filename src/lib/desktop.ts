@@ -41,6 +41,7 @@ export type DesktopBackend = {
     setWeakNetwork: (payload: { profile: WeakNetworkProfile }) => Promise<WeakNetworkProfile>;
     breakpoints: () => Promise<BreakpointRequest[]>;
     resolveBreakpoint: (payload: { decision: BreakpointDecision }) => Promise<BreakpointRequest[]>;
+    openBrowser: (payload: { target: string }) => Promise<{ browser: string; url: string; proxy: string }>;
   };
   cert: {
     info: () => Promise<CertInfo>;
@@ -126,6 +127,8 @@ function createTauriBackend(invoke: TauriInvoke): DesktopBackend {
       setWeakNetwork: (payload) => invokeProxy<WeakNetworkProfile>(invoke, "proxy_set_weak_network", payload),
       breakpoints: () => invokeProxy<BreakpointRequest[]>(invoke, "proxy_breakpoints"),
       resolveBreakpoint: (payload) => invokeProxy<BreakpointRequest[]>(invoke, "proxy_resolve_breakpoint", payload),
+      openBrowser: (payload) =>
+        invokeProxy<{ browser: string; url: string; proxy: string }>(invoke, "open_capture_browser", payload),
     },
     cert: {
       info: () => invokeProxy<CertInfo>(invoke, "cert_info"),
@@ -448,6 +451,11 @@ function createWebDemoBackend(): DesktopBackend {
         breakpoints = breakpoints.filter((item) => item.id !== payload.decision.id);
         return breakpoints;
       },
+      openBrowser: async (payload) => ({
+        browser: "Demo browser",
+        url: payload.target,
+        proxy: "127.0.0.1:9090",
+      }),
     },
     cert: {
       info: async () => ({
@@ -622,6 +630,7 @@ export function createDesktopBackend(options: CreateDesktopBackendOptions = {}):
       setWeakNetwork: async (payload) => (await resolveBackend()).proxy.setWeakNetwork(payload),
       breakpoints: async () => (await resolveBackend()).proxy.breakpoints(),
       resolveBreakpoint: async (payload) => (await resolveBackend()).proxy.resolveBreakpoint(payload),
+      openBrowser: async (payload) => (await resolveBackend()).proxy.openBrowser(payload),
     },
     cert: {
       info: async () => (await resolveBackend()).cert.info(),

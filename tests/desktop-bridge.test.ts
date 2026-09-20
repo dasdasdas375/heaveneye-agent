@@ -85,4 +85,21 @@ describe("desktop bridge", () => {
     });
     expect(receivedArgs).toEqual({ knownRevision: "12-abcd" });
   });
+
+  it("opens a dedicated capture browser through Tauri", async () => {
+    let receivedArgs: Record<string, unknown> | undefined;
+    const backend = createDesktopBackend({
+      loadTauriInvoke: async () => async (command: string, args?: Record<string, unknown>) => {
+        expect(command).toBe("open_capture_browser");
+        receivedArgs = args;
+        return { browser: "Microsoft Edge", url: "http://127.0.0.1:5188/", proxy: "http://127.0.0.1:9090" };
+      },
+    });
+
+    await expect(backend.proxy.openBrowser({ target: "http://127.0.0.1:5188" })).resolves.toMatchObject({
+      browser: "Microsoft Edge",
+      proxy: "http://127.0.0.1:9090",
+    });
+    expect(receivedArgs).toEqual({ target: "http://127.0.0.1:5188" });
+  });
 });

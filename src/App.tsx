@@ -3293,14 +3293,28 @@ export function App() {
       const nextStatus = await desktopBackend.proxy.start();
       try {
         const nextSystemProxy = await desktopBackend.systemProxy.apply();
-        return { nextStatus, nextSystemProxy, systemProxyError: null };
+        return { nextStatus, nextSystemProxy, systemProxyError: null, captureBrowser: null, captureBrowserError: null };
       } catch (systemProxyError) {
         const nextSystemProxy = await desktopBackend.systemProxy.status().catch(() => null);
-        return {
-          nextStatus,
-          nextSystemProxy,
-          systemProxyError: systemProxyError instanceof Error ? systemProxyError.message : String(systemProxyError),
-        };
+        try {
+          const captureBrowser = await desktopBackend.proxy.openBrowser({ target: domainInput });
+          return {
+            nextStatus,
+            nextSystemProxy,
+            systemProxyError: systemProxyError instanceof Error ? systemProxyError.message : String(systemProxyError),
+            captureBrowser,
+            captureBrowserError: null,
+          };
+        } catch (captureBrowserError) {
+          return {
+            nextStatus,
+            nextSystemProxy,
+            systemProxyError: systemProxyError instanceof Error ? systemProxyError.message : String(systemProxyError),
+            captureBrowser: null,
+            captureBrowserError:
+              captureBrowserError instanceof Error ? captureBrowserError.message : String(captureBrowserError),
+          };
+        }
       }
     });
 
@@ -3310,9 +3324,26 @@ export function App() {
         setSystemProxy(result.nextSystemProxy);
       }
       if (result.systemProxyError) {
-        setError(`代理已启动，但系统代理接入失败：${result.systemProxyError}`);
+        if (result.captureBrowser) {
+          setNotice(
+            `检测到已有系统代理，未修改整机网络；已打开 ${result.captureBrowser.browser} 抓包窗口，仅该窗口使用 ${result.captureBrowser.proxy}。`,
+          );
+        } else {
+          setError(
+            `代理已启动，但系统代理接入失败：${result.systemProxyError}${
+              result.captureBrowserError ? `；抓包浏览器启动失败：${result.captureBrowserError}` : ""
+            }`,
+          );
+        }
       }
       await refresh({ forceSlowNative: true });
+    }
+  }
+
+  async function openCaptureBrowserWindow() {
+    const launched = await runAction("capture-browser", () => desktopBackend.proxy.openBrowser({ target: domainInput }));
+    if (launched) {
+      setNotice(`已打开 ${launched.browser} 抓包窗口：${launched.url}，仅该窗口使用 ${launched.proxy}。`);
     }
   }
 
@@ -4608,7 +4639,8 @@ export function App() {
                 <span>
                   系统代理未接入当前抓包端口。{systemProxy.service ? `${systemProxy.service} ` : ""}
                   PAC {formatAutoProxySetting(systemProxy.autoProxy)} / HTTP {formatProxySetting(systemProxy.http)} / HTTPS{" "}
-                  {formatProxySetting(systemProxy.https)} / SOCKS {formatProxySetting(systemProxy.socks)}
+                  {formatProxySetting(systemProxy.https)} / SOCKS {formatProxySetting(systemProxy.socks)}。可使用独立抓包浏览器，
+                  不修改整机网络。
                 </span>
               ) : (
                 <span>
@@ -4616,6 +4648,17 @@ export function App() {
                 </span>
               )}
               <div className="proxy-actions">
+                {status.running && isWindowsRuntime() ? (
+                  <button
+                    className="inline-action cert-primary"
+                    onClick={openCaptureBrowserWindow}
+                    disabled={busyAction !== null}
+                    title="打开只使用 HeavenEye 代理的独立 Edge/Chrome 窗口"
+                  >
+                    {busyAction === "capture-browser" ? <Loader2 size={14} className="spin" /> : <Globe2 size={14} />}
+                    <span>抓包浏览器</span>
+                  </button>
+                ) : null}
                 {systemProxy.canRestore ? (
                   <button
                     className="inline-action secondary"

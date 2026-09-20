@@ -25,6 +25,8 @@ use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "windows")]
+use std::process::Command;
 use std::sync::Mutex;
 use system_proxy::SystemProxyManager;
 use tauri::{Emitter, Manager};
@@ -486,6 +488,125 @@ fn open_url(url: String) -> Result<(), String> {
     }
 }
 
+fn normalize_capture_browser_target(target: &str) -> Result<String, String> {
+    let first = target
+        .split(|character: char| character == ',' || character == ';' || character.is_whitespace())
+        .find(|item| !item.trim().is_empty())
+        .ok_or_else(|| "请先填写要访问的目标地址。".to_string())?;
+    let candidate = if first.starts_with("http://") || first.starts_with("https://") {
+        first.to_string()
+    } else {
+        let host = first.split('/').next().unwrap_or_default();
+        let scheme = if host.starts_with("localhost")
+            || host.starts_with("127.")
+            || host.starts_with("[::1]")
+        {
+            "http"
+        } else {
+            "https"
+        };
+        format!("{scheme}://{first}")
+    };
+    let parsed = url::Url::parse(&candidate).map_err(|error| format!("目标地址无效：{error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err("抓包浏览器只支持有效的 HTTP 或 HTTPS 地址。".into());
+    }
+    Ok(parsed.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_capture_browser_candidates() -> Vec<(&'static str, PathBuf)> {
+    let mut candidates = Vec::new();
+    for (environment, relative, name) in [
+        (
+            "ProgramFiles(x86)",
+            "Microsoft/Edge/Application/msedge.exe",
+            "Microsoft Edge",
+        ),
+        (
+            "ProgramFiles",
+            "Microsoft/Edge/Application/msedge.exe",
+            "Microsoft Edge",
+        ),
+        (
+            "LOCALAPPDATA",
+            "Microsoft/Edge/Application/msedge.exe",
+            "Microsoft Edge",
+        ),
+        (
+            "ProgramFiles",
+            "Google/Chrome/Application/chrome.exe",
+            "Google Chrome",
+        ),
+        (
+            "ProgramFiles(x86)",
+            "Google/Chrome/Application/chrome.exe",
+            "Google Chrome",
+        ),
+        (
+            "LOCALAPPDATA",
+            "Google/Chrome/Application/chrome.exe",
+            "Google Chrome",
+        ),
+    ] {
+        if let Some(root) = env::var_os(environment) {
+            candidates.push((name, PathBuf::from(root).join(relative)));
+        }
+    }
+    candidates
+}
+
+#[tauri::command]
+fn open_capture_browser(
+    target: String,
+    state: tauri::State<AppState>,
+) -> Result<HashMap<String, String>, String> {
+    let target_url = normalize_capture_browser_target(&target)?;
+    let config = config_snapshot(&state);
+    let proxy_status = state
+        .proxy
+        .lock()
+        .expect("proxy mutex poisoned")
+        .status(&config);
+    if !proxy_status.running {
+        return Err("请先启动 HeavenEye 抓包代理。".into());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let (browser_name, browser_path) = windows_capture_browser_candidates()
+            .into_iter()
+            .find(|(_, path)| path.is_file())
+            .ok_or_else(|| "未找到 Microsoft Edge 或 Google Chrome。".to_string())?;
+        let profile_dir = user_data_dir().join("capture-browser-profile");
+        fs::create_dir_all(&profile_dir).map_err(|error| error.to_string())?;
+        let proxy = format!("http://127.0.0.1:{}", proxy_status.port);
+        Command::new(&browser_path)
+            .arg(format!("--proxy-server={proxy}"))
+            .arg("--proxy-bypass-list=<-loopback>")
+            .arg(format!("--user-data-dir={}", profile_dir.display()))
+            .args([
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--new-window",
+            ])
+            .arg(&target_url)
+            .spawn()
+            .map_err(|error| format!("抓包浏览器启动失败：{error}"))?;
+        return Ok(HashMap::from([
+            ("browser".into(), browser_name.into()),
+            ("url".into(), target_url),
+            ("proxy".into(), proxy),
+        ]));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = target_url;
+        Err("独立抓包浏览器目前仅支持 Windows。".into())
+    }
+}
+
 #[tauri::command]
 fn system_proxy_status(state: tauri::State<AppState>) -> Result<models::SystemProxyStatus, String> {
     let config = config_snapshot(&state);
@@ -751,6 +872,7 @@ fn main() {
             cert_uninstall_root,
             cert_open_root,
             open_url,
+            open_capture_browser,
             ai_test_connection,
             ai_update_config,
             ai_analyze_failures,
@@ -772,7 +894,9 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_rustls_crypto_provider, find_workspace_root};
+    use super::{
+        ensure_rustls_crypto_provider, find_workspace_root, normalize_capture_browser_target,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -816,5 +940,17 @@ mod tests {
         ensure_rustls_crypto_provider();
 
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    #[test]
+    fn normalizes_capture_browser_targets() {
+        assert_eq!(
+            normalize_capture_browser_target("http://127.0.0.1:5188, api.example.test").unwrap(),
+            "http://127.0.0.1:5188/"
+        );
+        assert_eq!(
+            normalize_capture_browser_target("app.example.test/path").unwrap(),
+            "https://app.example.test/path"
+        );
     }
 }
