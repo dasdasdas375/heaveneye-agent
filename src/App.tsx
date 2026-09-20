@@ -177,6 +177,7 @@ type CertTrustDialog = {
   hint: string;
   certPath: string;
   command: string;
+  platform: "windows" | "macos";
 };
 
 const defaultStructuredFilters: StructuredFilters = {
@@ -1024,10 +1025,6 @@ function shellQuote(value: string) {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
-function powerShellQuote(value: string) {
-  return `'${value.replace(/'/g, "''")}'`;
-}
-
 function isWindowsRuntime() {
   if (typeof navigator === "undefined") {
     return false;
@@ -1040,9 +1037,7 @@ function buildTrustCertificateCommand(certPath: string) {
     return "";
   }
   if (isWindowsRuntime()) {
-    return `powershell -NoProfile -ExecutionPolicy Bypass -Command "Import-Certificate -FilePath ${powerShellQuote(
-      certPath,
-    )} -CertStoreLocation Cert:\\CurrentUser\\Root"`;
+    return `certutil -user -addstore -f Root "${certPath.replace(/"/g, '\\"')}"`;
   }
   return `sudo security add-trusted-cert -d -r trustRoot -p ssl -k /Library/Keychains/System.keychain ${shellQuote(certPath)}`;
 }
@@ -1052,16 +1047,21 @@ function buildCertTrustFailureDialog(
   message: string,
   certPath: string,
 ): CertTrustDialog {
+  const platform = isWindowsRuntime() ? "windows" : "macos";
   const deniedByInteraction = /authorization was denied|no user interaction|user interaction was possible/i.test(message);
   return {
     title,
     message,
     detail: message,
-    hint: deniedByInteraction
-      ? "macOS 没有允许 HeavenEye Agent 弹出管理员授权窗口，或授权已被取消。可以重试一次；如果仍失败，请复制下方命令到终端执行，或打开证书后在钥匙串中手动设为始终信任。"
-      : "系统没有完成根证书信任配置。请查看完整错误；可以重试一键信任，或复制终端命令手动加入系统钥匙串。",
+    hint:
+      platform === "windows"
+        ? "Windows 没有确认当前证书位于“当前用户”的受信任根证书库。可以先重新检测；若仍失败，请复制下方命令到终端执行。"
+        : deniedByInteraction
+          ? "macOS 没有允许 HeavenEye Agent 弹出管理员授权窗口，或授权已被取消。可以重试一次；如果仍失败，请复制下方命令到终端执行，或打开证书后在钥匙串中手动设为始终信任。"
+          : "系统没有完成根证书信任配置。请查看完整错误；可以重试一键信任，或复制终端命令手动加入系统钥匙串。",
     certPath,
     command: buildTrustCertificateCommand(certPath),
+    platform,
   };
 }
 
@@ -2880,6 +2880,7 @@ export function App() {
   const hasBootstrappedSessionRef = useRef(false);
   const refreshInFlightRef = useRef(false);
   const lastSlowNativeRefreshRef = useRef(0);
+  const certStateVersionRef = useRef(0);
   const flowRevisionRef = useRef<string | null>(null);
   const locatedFlowTimerRef = useRef<number | null>(null);
   const bodyPrefetchKeysRef = useRef<Set<string>>(new Set());
@@ -3200,6 +3201,7 @@ export function App() {
     }
     refreshInFlightRef.current = true;
     try {
+      const certStateVersionAtStart = certStateVersionRef.current;
       const now = Date.now();
       const shouldRefreshSlowNative =
         options.forceSlowNative || now - lastSlowNativeRefreshRef.current >= slowNativeRefreshIntervalMs;
@@ -3230,7 +3232,7 @@ export function App() {
       setBreakpoints(nextBreakpoints);
       if (slowNativeState) {
         const [nextCertInfo, nextSystemProxy] = slowNativeState;
-        if (nextCertInfo) {
+        if (nextCertInfo && certStateVersionRef.current === certStateVersionAtStart) {
           setCertInfo(nextCertInfo);
         }
         setSystemProxy(nextSystemProxy);
@@ -3327,9 +3329,15 @@ export function App() {
     setError(null);
     setNotice(null);
     setCertTrustDialog(null);
+    certStateVersionRef.current += 1;
     try {
-      const nextCertInfo = await desktopBackend.cert.installRoot();
+      let nextCertInfo = await desktopBackend.cert.installRoot();
+      for (let attempt = 0; attempt < 3 && !nextCertInfo.trusted; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 200 * (attempt + 1)));
+        nextCertInfo = await desktopBackend.cert.info();
+      }
       await waitForMinimumDuration();
+      certStateVersionRef.current += 1;
       setCertInfo(nextCertInfo);
       if (nextCertInfo.trusted) {
         setNotice("HeavenEye Agent 已完成根证书安装并设置信任，HTTPS 明文抓包可以正常使用。");
@@ -3352,10 +3360,12 @@ export function App() {
   }
 
   async function uninstallRootCertificate() {
+    certStateVersionRef.current += 1;
     const nextCertInfo = await runAction("uninstall-cert", () => desktopBackend.cert.uninstallRoot(), {
       minimumMs: 350,
     });
     if (nextCertInfo) {
+      certStateVersionRef.current += 1;
       setCertInfo(nextCertInfo);
       await refresh();
     }
@@ -3368,6 +3378,7 @@ export function App() {
     if (!nextCertInfo) {
       return;
     }
+    certStateVersionRef.current += 1;
     setCertInfo(nextCertInfo);
     if (nextCertInfo.trusted) {
       setCertTrustDialog(null);
@@ -4531,8 +4542,10 @@ export function App() {
                 <strong>HTTPS 证书未信任</strong>
                 <span>
                   {certInfo.canInstall
-                    ? "Agent 可自动安装并设置信任，macOS 会请求管理员授权。"
-                    : "请打开根证书，并在系统钥匙串中手动设为始终信任。"}
+                    ? certInfo.platform === "windows"
+                      ? "Agent 可加入当前 Windows 用户的受信任根证书库，无需管理员权限。"
+                      : "Agent 可自动安装并设置信任，macOS 会请求管理员授权。"
+                    : "请打开根证书，并在系统中手动设为始终信任。"}
                 </span>
               </div>
               <div className="cert-actions">
@@ -4541,7 +4554,11 @@ export function App() {
                     className="inline-action cert-primary"
                     onClick={installRootCertificate}
                     disabled={busyAction !== null}
-                    title="HeavenEye Agent 会把根证书加入系统钥匙串并设为 SSL 信任；需要输入 macOS 管理员密码。"
+                    title={
+                      certInfo.platform === "windows"
+                        ? "把根证书加入当前 Windows 用户的受信任根证书库"
+                        : "把根证书加入系统钥匙串并设为 SSL 信任；需要输入 macOS 管理员密码"
+                    }
                   >
                     {busyAction === "install-cert" ? (
                       <Loader2 size={14} className="spin" />
@@ -4559,6 +4576,15 @@ export function App() {
                 >
                   <FolderOpen size={14} />
                   <span>打开证书</span>
+                </button>
+                <button
+                  className="inline-action secondary"
+                  onClick={recheckRootCertificate}
+                  disabled={busyAction !== null}
+                  title="重新读取系统证书信任状态"
+                >
+                  {busyAction === "cert-info" ? <Loader2 size={14} className="spin" /> : <RefreshCcw size={14} />}
+                  <span>重新检测</span>
                 </button>
                 {certInfo.canUninstall ? (
                   <button
@@ -5933,7 +5959,11 @@ export function App() {
             <div className="inspector-modal-head">
               <div>
                 <h2>{certTrustDialog.title}</h2>
-                <div className="inspector-modal-hint">HeavenEye Agent 没有完成 macOS 根证书信任配置。</div>
+                <div className="inspector-modal-hint">
+                  HeavenEye Agent 没有确认
+                  {certTrustDialog.platform === "windows" ? " Windows 当前用户根证书" : " macOS 根证书"}
+                  信任配置。
+                </div>
               </div>
               <button className="icon-button icon-only" type="button" onClick={() => setCertTrustDialog(null)}>
                 <X size={16} />
@@ -5970,11 +6000,19 @@ export function App() {
 
               <div className="cert-trust-steps">
                 <strong>可选处理方式</strong>
-                <ol>
-                  <li>点击“重试一键信任”，在 macOS 弹窗里输入管理员密码。</li>
-                  <li>如果仍然失败，复制终端命令执行，再回到 HeavenEye Agent 重新检测。</li>
-                  <li>也可以点击“打开证书”，在钥匙串访问中把 HeavenEye Agent CA 设置为始终信任。</li>
-                </ol>
+                {certTrustDialog.platform === "windows" ? (
+                  <ol>
+                    <li>先点击“重新检测”，读取当前用户的受信任根证书库。</li>
+                    <li>如果仍然失败，复制终端命令执行，再回到 HeavenEye Agent 重新检测。</li>
+                    <li>也可以点击“打开证书”，选择“当前用户”并安装到“受信任的根证书颁发机构”。</li>
+                  </ol>
+                ) : (
+                  <ol>
+                    <li>点击“重试一键信任”，在 macOS 弹窗里输入管理员密码。</li>
+                    <li>如果仍然失败，复制终端命令执行，再回到 HeavenEye Agent 重新检测。</li>
+                    <li>也可以点击“打开证书”，在钥匙串访问中把 HeavenEye Agent CA 设置为始终信任。</li>
+                  </ol>
+                )}
               </div>
             </div>
 

@@ -7,6 +7,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
 
 const ROOT_CERT_FILE: &str = "heaveneye-agent-root-ca.pem";
 const ROOT_KEY_FILE: &str = "heaveneye-agent-root-ca-key.pem";
@@ -106,8 +108,7 @@ impl CertificateService {
 
         let root_cert_pem =
             fs::read_to_string(&root.cert_path).map_err(|error| error.to_string())?;
-        let root_key_pem =
-            fs::read_to_string(&root.key_path).map_err(|error| error.to_string())?;
+        let root_key_pem = fs::read_to_string(&root.key_path).map_err(|error| error.to_string())?;
         let root_key = KeyPair::from_pem(&root_key_pem).map_err(|error| error.to_string())?;
         let issuer = Issuer::from_ca_cert_pem(&root_cert_pem, root_key)
             .map_err(|error| error.to_string())?;
@@ -152,7 +153,15 @@ impl CertificateService {
 
         if cfg!(target_os = "windows") {
             install_windows_root_certificate(&root.cert_path)?;
-            return self.cert_info();
+            let mut latest = self.cert_info()?;
+            for attempt in 0..5 {
+                if latest.trusted {
+                    return Ok(latest);
+                }
+                thread::sleep(Duration::from_millis(100 * (attempt + 1)));
+                latest = self.cert_info()?;
+            }
+            return Ok(latest);
         }
 
         let script = format!(
@@ -231,8 +240,8 @@ fn root_certificate_params() -> CertificateParams {
 }
 
 fn host_certificate_params(host: &str) -> Result<CertificateParams, String> {
-    let mut params = CertificateParams::new(vec![host.to_string()])
-        .map_err(|error| error.to_string())?;
+    let mut params =
+        CertificateParams::new(vec![host.to_string()]).map_err(|error| error.to_string())?;
     let mut distinguished_name = DistinguishedName::new();
     distinguished_name.push(DnType::CommonName, host);
     distinguished_name.push(DnType::OrganizationName, "HeavenEye Agent");
@@ -296,10 +305,15 @@ $ErrorActionPreference = 'Stop'
 $certPath = {cert_path}
 $store = {store}
 $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($certPath)
+$existing = Get-ChildItem -Path $store |
+  Where-Object {{ $_.Thumbprint -eq $cert.Thumbprint }} |
+  Select-Object -First 1
+if ($null -eq $existing) {{
+  Import-Certificate -FilePath $certPath -CertStoreLocation $store | Out-Null
+}}
 Get-ChildItem -Path $store |
-  Where-Object {{ $_.Subject -eq $cert.Subject -or $_.Thumbprint -eq $cert.Thumbprint }} |
+  Where-Object {{ $_.Subject -eq $cert.Subject -and $_.Thumbprint -ne $cert.Thumbprint }} |
   Remove-Item -Force
-Import-Certificate -FilePath $certPath -CertStoreLocation $store | Out-Null
 "#
     );
     run_powershell(&script).map(|_| ())
