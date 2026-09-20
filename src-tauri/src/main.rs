@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, OpenOptions};
+#[cfg(target_os = "windows")]
+use std::io::Read;
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -276,7 +278,7 @@ fn restore_system_proxy_on_exit(app_handle: &tauri::AppHandle) {
         .system_proxy
         .lock()
         .expect("system proxy mutex poisoned")
-        .restore(target_port);
+        .cleanup_stale(target_port);
 }
 
 fn config_snapshot(state: &tauri::State<AppState>) -> AppConfig {
@@ -307,11 +309,11 @@ fn proxy_stop(state: tauri::State<AppState>) -> Result<models::ProxyStatus, Stri
     proxy.stop()?;
     let status = proxy.status(&config);
     drop(proxy);
-    let _ = state
+    state
         .system_proxy
         .lock()
         .expect("system proxy mutex poisoned")
-        .restore(target_port);
+        .cleanup_stale(target_port)?;
     Ok(status)
 }
 
@@ -680,7 +682,37 @@ async fn ai_ask_agent_stream(
         .await
 }
 
+#[cfg(target_os = "windows")]
+fn run_system_proxy_watchdog_if_requested() -> bool {
+    let mut arguments = env::args_os();
+    let _ = arguments.next();
+    if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--system-proxy-watchdog")) {
+        return false;
+    }
+
+    let target_port = arguments
+        .next()
+        .and_then(|value| value.to_string_lossy().parse::<u16>().ok());
+    let snapshot_path = arguments.next().map(PathBuf::from);
+    if let (Some(target_port), Some(snapshot_path)) = (target_port, snapshot_path) {
+        let mut input = std::io::stdin();
+        let mut buffer = [0_u8; 1];
+        while input.read(&mut buffer).unwrap_or(0) > 0 {}
+        let manager = SystemProxyManager::new(snapshot_path);
+        let _ = manager.cleanup_stale(target_port);
+    }
+    true
+}
+
+#[cfg(not(target_os = "windows"))]
+fn run_system_proxy_watchdog_if_requested() -> bool {
+    false
+}
+
 fn main() {
+    if run_system_proxy_watchdog_if_requested() {
+        return;
+    }
     ensure_rustls_crypto_provider();
     let config = load_config();
     let system_proxy = SystemProxyManager::new(system_proxy_snapshot_path());

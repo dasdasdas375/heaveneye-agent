@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{ChildStdin, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use url::Url;
 
@@ -15,6 +16,7 @@ const WINDOWS_INTERNET_SETTINGS_KEY: &str =
 #[derive(Clone)]
 pub struct SystemProxyManager {
     snapshot_path: PathBuf,
+    watchdog_input: Arc<Mutex<Option<ChildStdin>>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -45,7 +47,10 @@ struct WindowsProxySnapshot {
 
 impl SystemProxyManager {
     pub fn new(snapshot_path: PathBuf) -> Self {
-        Self { snapshot_path }
+        Self {
+            snapshot_path,
+            watchdog_input: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub fn status(&self, target_port: u16) -> Result<SystemProxyStatus, String> {
@@ -78,6 +83,7 @@ impl SystemProxyManager {
         target_port: u16,
         capture_hosts: &[String],
     ) -> Result<SystemProxyStatus, String> {
+        validate_system_proxy_scope(capture_hosts)?;
         if cfg!(target_os = "windows") {
             return self.apply_windows(target_port, capture_hosts);
         }
@@ -241,13 +247,15 @@ impl SystemProxyManager {
         target_port: u16,
         capture_hosts: &[String],
     ) -> Result<SystemProxyStatus, String> {
+        let current = read_windows_proxy_snapshot()?;
+        reject_conflicting_windows_proxy(&current, target_port)?;
         if !self.snapshot_path.exists() {
             let snapshot = SystemProxySnapshot {
                 service: WINDOWS_SERVICE_NAME.to_string(),
                 http: empty_setting(),
                 https: empty_setting(),
                 socks: empty_setting(),
-                windows: Some(read_windows_proxy_snapshot()?),
+                windows: Some(current),
                 auto_proxy: empty_url_setting(),
                 auto_discovery_enabled: false,
             };
@@ -255,7 +263,43 @@ impl SystemProxyManager {
         }
 
         set_windows_pac(target_port, capture_hosts)?;
+        if let Err(error) = self.ensure_windows_watchdog(target_port) {
+            let _ = self.restore_windows(target_port);
+            return Err(format!("系统代理安全守护启动失败，已回滚代理设置：{error}"));
+        }
         self.status(target_port)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn ensure_windows_watchdog(&self, target_port: u16) -> Result<(), String> {
+        let mut watchdog_input = self
+            .watchdog_input
+            .lock()
+            .map_err(|_| "system proxy watchdog mutex poisoned".to_string())?;
+        if watchdog_input.is_some() {
+            return Ok(());
+        }
+
+        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        let mut child = Command::new(executable)
+            .arg("--system-proxy-watchdog")
+            .arg(target_port.to_string())
+            .arg(&self.snapshot_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        *watchdog_input = child.stdin.take();
+        if watchdog_input.is_none() {
+            return Err("watchdog stdin pipe was not created".to_string());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn ensure_windows_watchdog(&self, _target_port: u16) -> Result<(), String> {
+        Ok(())
     }
 
     fn cleanup_stale_windows(&self, target_port: u16) -> Result<SystemProxyStatus, String> {
@@ -466,6 +510,57 @@ impl SystemProxyManager {
         }
         Ok(matches)
     }
+}
+
+fn validate_system_proxy_scope(capture_hosts: &[String]) -> Result<(), String> {
+    if capture_hosts.is_empty() {
+        return Err("请先填写并应用目标域名；空目标不会抓取任何请求。".to_string());
+    }
+    if capture_hosts.iter().any(|host| host.trim() == "*") {
+        return Err(
+            "为避免接管整台电脑的网络，系统代理模式不允许使用 *；请填写一个或多个目标域名。"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn reject_conflicting_windows_proxy(
+    settings: &WindowsProxySnapshot,
+    target_port: u16,
+) -> Result<(), String> {
+    if auto_proxy_matches(
+        &windows_auto_proxy_setting(settings.auto_config_url.as_deref()),
+        target_port,
+    ) {
+        return Ok(());
+    }
+    if settings
+        .auto_config_url
+        .as_deref()
+        .is_some_and(|url| !url.trim().is_empty())
+    {
+        return Err(
+            "检测到已有系统 PAC。为避免覆盖现有联网配置，HeavenEye 已取消系统代理接管；请先关闭现有代理，或在目标浏览器中单独配置 127.0.0.1 代理。"
+                .to_string(),
+        );
+    }
+
+    let enabled = settings.proxy_enable.unwrap_or(0) != 0;
+    let (http, https, socks) =
+        parse_windows_proxy_settings(enabled, settings.proxy_server.as_deref().unwrap_or(""));
+    let conflicts = [&http, &https, &socks].into_iter().any(|setting| {
+        setting.enabled
+            && !(setting.host.eq_ignore_ascii_case(TARGET_HOST)
+                && setting.port == Some(target_port))
+    });
+    if conflicts {
+        return Err(
+            "检测到已有系统代理。为避免中断整台电脑的网络，HeavenEye 已取消覆盖；请先关闭现有代理，或在目标浏览器中单独配置 127.0.0.1 代理。"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn empty_setting() -> SystemProxySetting {
@@ -968,7 +1063,8 @@ fn run_networksetup(args: &[&str]) -> Result<String, String> {
 mod tests {
     use super::{
         auto_proxy_matches, parse_auto_discovery_enabled, parse_auto_proxy_setting,
-        parse_proxy_setting, parse_windows_proxy_settings, windows_auto_proxy_setting,
+        parse_proxy_setting, parse_windows_proxy_settings, reject_conflicting_windows_proxy,
+        validate_system_proxy_scope, windows_auto_proxy_setting, WindowsProxySnapshot,
     };
 
     #[test]
@@ -1061,5 +1157,36 @@ mod tests {
     fn parses_auto_discovery_output() {
         assert!(parse_auto_discovery_enabled("Auto Proxy Discovery: On\n").expect("parse on"));
         assert!(!parse_auto_discovery_enabled("Auto Proxy Discovery: Off\n").expect("parse off"));
+    }
+
+    #[test]
+    fn system_proxy_requires_specific_capture_hosts() {
+        assert!(validate_system_proxy_scope(&[]).is_err());
+        assert!(validate_system_proxy_scope(&["*".to_string()]).is_err());
+        assert!(validate_system_proxy_scope(&["api.example.test".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn windows_system_proxy_does_not_overwrite_an_existing_proxy() {
+        let settings = WindowsProxySnapshot {
+            proxy_enable: Some(1),
+            proxy_server: Some("127.0.0.1:7890".to_string()),
+            proxy_override: None,
+            auto_config_url: None,
+            auto_detect: None,
+        };
+        assert!(reject_conflicting_windows_proxy(&settings, 9090).is_err());
+    }
+
+    #[test]
+    fn windows_system_proxy_allows_its_own_pac() {
+        let settings = WindowsProxySnapshot {
+            proxy_enable: Some(0),
+            proxy_server: Some("127.0.0.1:7890".to_string()),
+            proxy_override: None,
+            auto_config_url: Some("http://127.0.0.1:9090/proxy.pac?v=abc".to_string()),
+            auto_detect: Some(0),
+        };
+        assert!(reject_conflicting_windows_proxy(&settings, 9090).is_ok());
     }
 }

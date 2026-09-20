@@ -359,6 +359,8 @@ const copyByLanguage = {
     har: "HAR",
     apply: "Apply",
     targetPlaceholder: "目标域名，例如 example.test",
+    targetRequired: "请先填写目标域名，再启动抓包。开始时会自动应用该域名。",
+    wildcardBlocked: "为避免接管整台电脑的网络，系统代理模式不能使用 *；请填写具体目标域名。",
     filterPlaceholder: "过滤名称、域名、路径、状态",
     name: "名称",
     status: "状态",
@@ -535,6 +537,8 @@ const copyByLanguage = {
     har: "HAR",
     apply: "Apply",
     targetPlaceholder: "Target domain, e.g. example.test",
+    targetRequired: "Enter a target domain before starting capture. Start applies it automatically.",
+    wildcardBlocked: "System proxy mode does not allow * because it would route the whole machine. Enter specific domains.",
     filterPlaceholder: "Filter name, host, path, status",
     name: "Name",
     status: "Status",
@@ -3270,7 +3274,20 @@ export function App() {
   }
 
   async function startProxyClosedLoop() {
+    const requestedHosts = domainInput
+      .split(/[\s,;]+/)
+      .map((host) => host.trim())
+      .filter(Boolean);
+    if (!requestedHosts.length) {
+      setError(copy.targetRequired);
+      return;
+    }
+    if (requestedHosts.includes("*")) {
+      setError(copy.wildcardBlocked);
+      return;
+    }
     const result = await runAction("start", async () => {
+      await desktopBackend.proxy.setCaptureHosts({ hosts: domainInput });
       const nextStatus = await desktopBackend.proxy.start();
       try {
         const nextSystemProxy = await desktopBackend.systemProxy.apply();
